@@ -1,0 +1,17 @@
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["HUMAN_DISCORD_USER_ID"],
+  "conversation": {
+    "contextMessages": 12,
+    "maxPeerTurns": 2
+  },
+  "channels": {
+    "PRIVATE_CHANNEL_ID": {
+      "name": "private-room",
+      "requireMention": true,
+      "allowFrom": ["HUMAN_DISCORD_USER_ID"],
+      "allowBotMention": true,
+      "allowBotFrom": ["PEER_BOT_USER_ID"]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+temp/
+.env
+.env.*
+!.env.example
+
+# Private runtime config — copy from the tracked examples.
+config.json
+persona.md
