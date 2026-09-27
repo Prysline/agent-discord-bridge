@@ -1,38 +1,68 @@
-"""Deterministic routing and bounded peer-discussion policy."""
+"""Deterministic bounded-discussion state machine owned by the core.
 
+All events passed here are assumed to have already passed Discord allowlist
+checks.  Peer Discord output is observable context only; it never schedules
+another agent.  Runtime adapters do not own any state represented here.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
 from dataclasses import dataclass, field
+from typing import Literal
 import re
 
 
-VALID_MODES = {"human-turn", "bounded-discussion"}
-MENTION_RE = re.compile(r"<@!?\d+>")
+Phase = Literal[
+    "idle", "active", "closing-check", "completed", "stopped", "suspended"
+]
+ResultStatus = Literal["continue", "complete", "abstain"]
+DeliveryStatus = Literal["delivered", "not_delivered", "unknown"]
+FailureReason = Literal[
+    "timeout",
+    "adapter_error",
+    "execution_failure",
+    "participant_unavailable",
+    "discord_delivery_failure",
+]
+
+MENTION_RE = re.compile(r"^<@!?(\d+)>[ \t]*")
 
 
-def validate_config(config: dict) -> None:
-    if config.get("dmPolicy", "disabled") not in {"disabled", "allowlist"}:
-        raise ValueError("dmPolicy must be 'disabled' or 'allowlist'")
-    if not isinstance(config.get("allowFrom", []), list):
-        raise ValueError("allowFrom must be a list")
+@dataclass(frozen=True)
+class Participant:
+    agent_id: str
+    mention_id: str
+    budget_chars: int
+    max_calls: int
+    enabled: bool = True
+    available: bool = True
 
-    channels = config.get("channels")
-    if not isinstance(channels, dict) or not channels:
-        raise ValueError("channels must contain at least one explicit channel")
-    for channel_id, policy in channels.items():
-        if not str(channel_id).isdigit():
-            raise ValueError(f"channel id must be numeric: {channel_id}")
-        if not isinstance(policy, dict):
-            raise ValueError(f"channel policy must be an object: {channel_id}")
-        humans = policy.get("allowFrom")
-        if not isinstance(humans, list) or not humans:
-            raise ValueError(f"channel {channel_id} requires a non-empty allowFrom")
-        mode = policy.get("mode", config.get("conversation", {}).get("defaultMode"))
-        if mode not in VALID_MODES:
-            raise ValueError(f"channel {channel_id} has invalid mode: {mode}")
-        peers = policy.get("allowBotFrom", [])
-        if not isinstance(peers, list):
-            raise ValueError(f"channel {channel_id} allowBotFrom must be a list")
-        if mode == "bounded-discussion" and not peers:
-            raise ValueError(f"channel {channel_id} discussion mode requires allowBotFrom")
+    def __post_init__(self) -> None:
+        if not self.agent_id or not self.mention_id:
+            raise ValueError("participant identity must not be empty")
+        if self.budget_chars < 1 or self.max_calls < 1:
+            raise ValueError("participant quota must be positive")
+
+
+@dataclass
+class AgentDiscussionQuota:
+    budget_chars: int
+    max_calls: int
+    used_chars: int = 0
+    used_calls: int = 0
+
+    def can_dispatch(self) -> bool:
+        return self.used_chars < self.budget_chars and self.used_calls < self.max_calls
+
+
+@dataclass
+class DiscussionSafety:
+    global_max_dispatches: int
+    dispatched_calls: int = 0
+
+    def can_dispatch(self) -> bool:
+        return self.dispatched_calls < self.global_max_dispatches
 
 
 @dataclass(frozen=True)
@@ -40,117 +70,388 @@ class Event:
     channel_id: str
     author_id: str
     author_is_bot: bool
-    bot_user_id: str
-    is_dm: bool
     content: str
-    mention_ids: tuple[str, ...]
-    replies_to_bot: bool = False
 
 
 @dataclass(frozen=True)
-class Decision:
-    allowed: bool
-    is_peer: bool = False
-    discussion_active: bool = False
+class DispatchToken:
+    discussion_id: str
+    dispatch_index: int
+    agent_id: str
+    phase: Literal["active", "closing-check"]
+    context_revision: int
+    invalidation_version: int
+
+
+@dataclass(frozen=True)
+class Transition:
+    accepted: bool
+    action: str
     reason: str = ""
+    agent_id: str | None = None
+    token: DispatchToken | None = None
+
+
+@dataclass(frozen=True)
+class PendingResult:
+    token: DispatchToken
+    status: ResultStatus
+    text: str
 
 
 @dataclass
 class DiscussionState:
-    active: bool = False
-    turns: dict[str, int] = field(default_factory=dict)
-    total_characters: int = 0
+    phase: Phase = "idle"
+    discussion_id: str | None = None
+    goal: str = ""
+    participants: tuple[str, ...] = ()
+    next_index: int = 0
+    closing_remaining: list[str] = field(default_factory=list)
+    quotas: dict[str, AgentDiscussionQuota] = field(default_factory=dict)
+    safety: DiscussionSafety | None = None
+    context_revision: int = 0
+    invalidation_version: int = 0
+    in_flight: DispatchToken | None = None
+    pending_result: PendingResult | None = None
+    last_speaker: str | None = None
+    suspension_reason: str = ""
 
 
 class ConversationPolicy:
-    def __init__(self, config: dict):
-        validate_config(config)
-        self.config = config
-        discussion = config.get("conversation", {}).get("discussion", {})
-        self.start_command = str(discussion.get("startCommand", "!discuss"))
-        self.stop_command = str(discussion.get("stopCommand", "!stop"))
-        self.max_turns = int(discussion.get("maxTurnsPerBot", 5))
-        self.max_characters = int(discussion.get("maxTotalCharacters", 2000))
-        if self.max_turns < 1 or self.max_characters < 1:
-            raise ValueError("discussion limits must be positive")
+    """Pure state machine for bounded discussion scheduling and accounting."""
+
+    def __init__(
+        self,
+        participants: list[Participant],
+        *,
+        global_max_dispatches: int,
+        start_command: str = "!discuss",
+        stop_command: str = "!stop",
+    ) -> None:
+        if global_max_dispatches < 1:
+            raise ValueError("global_max_dispatches must be positive")
+        by_agent = {item.agent_id: item for item in participants}
+        by_mention = {item.mention_id: item for item in participants}
+        if len(by_agent) != len(participants) or len(by_mention) != len(participants):
+            raise ValueError("participant agent_id and mention_id must be unique")
+        self._participants = by_agent
+        self._mentions = by_mention
+        self.global_max_dispatches = global_max_dispatches
+        self.start_command = start_command
+        self.stop_command = stop_command
         self._states: dict[str, DiscussionState] = {}
+        self._discussion_counter = 0
 
     def state(self, channel_id: str) -> DiscussionState:
+        """Return a detached inspection snapshot, never the mutable live state."""
+        return deepcopy(self._state(channel_id))
+
+    def _state(self, channel_id: str) -> DiscussionState:
         return self._states.setdefault(channel_id, DiscussionState())
 
-    def _channel_policy(self, event: Event) -> dict | None:
-        return self.config.get("channels", {}).get(event.channel_id)
-
-    def _mode(self, policy: dict) -> str:
-        return policy.get("mode", self.config.get("conversation", {}).get("defaultMode"))
-
-    def observe_and_decide(self, event: Event) -> Decision:
-        if event.author_id == event.bot_user_id:
-            self._observe_bot(event)
-            return Decision(False, reason="self")
-
-        if event.is_dm:
-            if event.author_is_bot:
-                return Decision(False, reason="bot dm")
-            allowed = {str(value) for value in self.config.get("allowFrom", [])}
-            if self.config.get("dmPolicy") != "allowlist" or event.author_id not in allowed:
-                return Decision(False, reason="dm not allowed")
-            return Decision(True, reason="allowed dm")
-
-        policy = self._channel_policy(event)
-        if not policy:
-            return Decision(False, reason="channel not allowed")
-        mode = self._mode(policy)
-        state = self.state(event.channel_id)
+    def handle_event(self, event: Event) -> Transition:
+        """Apply an authorized Discord event without dispatching a model."""
+        state = self._state(event.channel_id)
+        content = event.content.strip()
 
         if event.author_is_bot:
-            allowed_peers = {str(value) for value in policy.get("allowBotFrom", [])}
-            if mode != "bounded-discussion" or event.author_id not in allowed_peers:
-                return Decision(False, reason="peer not allowed")
-            self._observe_bot(event)
-            if not state.active:
-                return Decision(False, reason="no active discussion")
-            if event.bot_user_id not in event.mention_ids:
-                return Decision(False, reason="peer did not mention bot")
-            if self._limit_reached(state):
-                state.active = False
-                return Decision(False, reason="discussion limit reached")
-            return Decision(True, is_peer=True, discussion_active=True, reason="peer turn")
+            state.context_revision += 1
+            return Transition(False, "context-observed", "peer output cannot schedule AI")
 
-        allowed_humans = {str(value) for value in policy.get("allowFrom", [])}
-        if event.author_id not in allowed_humans:
-            return Decision(False, reason="human not allowed")
+        if content == self.stop_command or content.startswith(self.stop_command + " "):
+            return self._stop(state)
 
-        content = event.content.strip()
-        if mode == "bounded-discussion" and content.startswith(self.stop_command):
-            state.active = False
-            return Decision(False, reason="discussion stopped")
-        if mode == "bounded-discussion" and content.startswith(self.start_command):
-            state.active = True
-            state.turns.clear()
-            state.total_characters = 0
-            first_mention = event.mention_ids[0] if event.mention_ids else None
-            return Decision(
-                first_mention == event.bot_user_id,
-                discussion_active=True,
-                reason="discussion started" if first_mention == event.bot_user_id else "waiting for first bot",
-            )
+        if content == self.start_command or content.startswith(self.start_command + " "):
+            if state.phase in {"active", "closing-check"}:
+                return Transition(False, "rejected", "discussion active; use !stop first")
+            return self._start(state, event.channel_id, content)
 
-        state.active = False
-        mentioned = event.bot_user_id in event.mention_ids
-        if policy.get("requireMention", True) and not (mentioned or event.replies_to_bot):
-            return Decision(False, reason="mention required")
-        return Decision(True, reason="human turn")
+        state.context_revision += 1
+        if state.phase == "closing-check":
+            state.phase = "active"
+            state.closing_remaining.clear()
+            state.invalidation_version += 1
+            state.in_flight = None
+            state.pending_result = None
+            return Transition(True, "context-intervention", "closing check cancelled")
+        if state.phase == "active":
+            return Transition(True, "context-intervention", "discussion remains active")
+        return Transition(True, "human-context", "no active discussion")
 
-    def _observe_bot(self, event: Event) -> None:
-        state = self.state(event.channel_id)
-        if not state.active:
-            return
-        state.turns[event.author_id] = state.turns.get(event.author_id, 0) + 1
-        state.total_characters += len(MENTION_RE.sub("", event.content).strip())
+    def next_dispatch(self, channel_id: str) -> Transition:
+        state = self._state(channel_id)
+        if state.in_flight is not None or state.pending_result is not None:
+            return Transition(False, "blocked", "dispatch or delivery already pending")
+        if state.phase not in {"active", "closing-check"}:
+            return Transition(False, "blocked", f"discussion is {state.phase}")
+        if state.safety is None or not state.safety.can_dispatch():
+            return self._suspend(state, "global dispatch limit reached")
 
-    def _limit_reached(self, state: DiscussionState) -> bool:
-        return (
-            state.total_characters >= self.max_characters
-            or any(turns >= self.max_turns for turns in state.turns.values())
+        if state.phase == "closing-check":
+            if not state.closing_remaining:
+                state.phase = "completed"
+                return Transition(False, "completed", "closing check finished")
+            agent_id = state.closing_remaining[0]
+            if not self._eligible(state, agent_id):
+                return self._suspend(
+                    state, "closing participant quota exhausted or unavailable"
+                )
+            return Transition(True, "dispatch-ready", agent_id=agent_id)
+
+        for offset in range(len(state.participants)):
+            index = (state.next_index + offset) % len(state.participants)
+            agent_id = state.participants[index]
+            if self._eligible(state, agent_id) and agent_id != state.last_speaker:
+                return Transition(True, "dispatch-ready", agent_id=agent_id)
+        return self._suspend(state, "quota/no eligible next participant")
+
+    def begin_dispatch(self, channel_id: str) -> Transition:
+        ready = self.next_dispatch(channel_id)
+        if not ready.accepted or ready.agent_id is None:
+            return ready
+
+        state = self._state(channel_id)
+        agent_id = ready.agent_id
+        quota = state.quotas[agent_id]
+        quota.used_calls += 1
+        assert state.safety is not None
+        state.safety.dispatched_calls += 1
+
+        token = DispatchToken(
+            discussion_id=state.discussion_id or "",
+            dispatch_index=state.safety.dispatched_calls,
+            agent_id=agent_id,
+            phase=state.phase,
+            context_revision=state.context_revision,
+            invalidation_version=state.invalidation_version,
         )
+        state.in_flight = token
+        if state.phase == "active":
+            state.next_index = (state.participants.index(agent_id) + 1) % len(
+                state.participants
+            )
+        return Transition(True, "dispatch-started", agent_id=agent_id, token=token)
+
+    def record_result(
+        self,
+        channel_id: str,
+        token: DispatchToken,
+        *,
+        status: ResultStatus,
+        text: str = "",
+    ) -> Transition:
+        state = self._state(channel_id)
+        invalid = self._validate_current_token(state, token)
+        if invalid is not None:
+            return invalid
+        self._validate_result(status, text)
+        if state.pending_result is not None:
+            return Transition(False, "blocked", "result already pending delivery")
+        result = PendingResult(token, status, text)
+        if status == "abstain":
+            state.in_flight = None
+            state.last_speaker = token.agent_id
+            return self._apply_result_semantics(state, result)
+        state.pending_result = result
+        return Transition(True, "delivery-pending", agent_id=token.agent_id, token=token)
+
+    def resolve_delivery(
+        self,
+        channel_id: str,
+        token: DispatchToken,
+        *,
+        delivery: DeliveryStatus,
+    ) -> Transition:
+        state = self._state(channel_id)
+        invalid = self._validate_current_token(state, token)
+        if invalid is not None:
+            return invalid
+        pending = state.pending_result
+        if pending is None or pending.token != token:
+            return Transition(False, "blocked", "no matching result pending delivery")
+        if delivery == "unknown":
+            return Transition(False, "delivery-pending", "delivery outcome unknown")
+        if delivery == "not_delivered":
+            return self._suspend(state, "delivery failed / not delivered")
+        if delivery != "delivered":
+            raise ValueError(f"invalid delivery status: {delivery}")
+
+        state.in_flight = None
+        state.pending_result = None
+        if pending.text:
+            state.quotas[token.agent_id].used_chars += len(pending.text)
+        state.last_speaker = token.agent_id
+        return self._apply_result_semantics(state, pending)
+
+    def fail_dispatch(
+        self, channel_id: str, token: DispatchToken, *, reason: FailureReason
+    ) -> Transition:
+        state = self._state(channel_id)
+        invalid = self._validate_current_token(state, token)
+        if invalid is not None:
+            return invalid
+        if reason not in {
+            "timeout",
+            "adapter_error",
+            "execution_failure",
+            "participant_unavailable",
+            "discord_delivery_failure",
+        }:
+            raise ValueError(f"invalid failure reason: {reason}")
+        return self._suspend(state, reason.replace("_", " "))
+
+    def _apply_result_semantics(
+        self, state: DiscussionState, pending: PendingResult
+    ) -> Transition:
+        token = pending.token
+
+        if token.phase == "active":
+            if pending.status == "complete":
+                state.phase = "closing-check"
+                state.closing_remaining = self._after(
+                    state.participants, token.agent_id
+                )[:-1]
+                if not state.closing_remaining:
+                    state.phase = "completed"
+                    return Transition(True, "completed", "no remaining participants")
+                return Transition(True, "closing-check", agent_id=token.agent_id)
+            return Transition(True, "result-recorded", agent_id=token.agent_id)
+
+        if not state.closing_remaining or state.closing_remaining[0] != token.agent_id:
+            return self._suspend(state, "closing-check state mismatch")
+        state.closing_remaining.pop(0)
+        state.next_index = (state.participants.index(token.agent_id) + 1) % len(
+            state.participants
+        )
+        if pending.status == "continue":
+            state.phase = "active"
+            state.closing_remaining.clear()
+            return Transition(True, "closing-cancelled", agent_id=token.agent_id)
+        if not state.closing_remaining:
+            state.phase = "completed"
+            return Transition(True, "completed", "closing check finished")
+        return Transition(True, "closing-recorded", agent_id=token.agent_id)
+
+    def on_process_restart(self) -> None:
+        for state in self._states.values():
+            if state.phase in {"active", "closing-check"}:
+                self._suspend(state, "process restarted")
+
+    def _start(
+        self, state: DiscussionState, channel_id: str, content: str
+    ) -> Transition:
+        parsed = self._parse_start(content)
+        if isinstance(parsed, str):
+            return Transition(False, "rejected", parsed)
+        mention_ids, goal = parsed
+        if len(mention_ids) < 2:
+            return Transition(False, "rejected", "at least two participants required")
+        if len(set(mention_ids)) != len(mention_ids):
+            return Transition(False, "rejected", "duplicate participant")
+
+        participants: list[Participant] = []
+        for mention_id in mention_ids:
+            participant = self._mentions.get(mention_id)
+            if participant is None:
+                return Transition(False, "rejected", "unknown participant")
+            if not participant.enabled:
+                return Transition(False, "rejected", "disabled participant")
+            if not participant.available:
+                return Transition(False, "rejected", "unavailable participant")
+            participants.append(participant)
+
+        self._discussion_counter += 1
+        state.phase = "active"
+        state.discussion_id = f"{channel_id}:{self._discussion_counter}"
+        state.goal = goal
+        state.participants = tuple(item.agent_id for item in participants)
+        state.next_index = 0
+        state.closing_remaining.clear()
+        state.quotas = {
+            item.agent_id: AgentDiscussionQuota(item.budget_chars, item.max_calls)
+            for item in participants
+        }
+        state.safety = DiscussionSafety(self.global_max_dispatches)
+        state.context_revision += 1
+        state.invalidation_version += 1
+        state.in_flight = None
+        state.pending_result = None
+        state.last_speaker = None
+        state.suspension_reason = ""
+        return Transition(True, "started", agent_id=state.participants[0])
+
+    def _parse_start(self, content: str) -> tuple[list[str], str] | str:
+        body = content[len(self.start_command) :].lstrip(" \t")
+        first_line, separator, remainder = body.partition("\n")
+        first_line = first_line.rstrip("\r")
+        if "--" in first_line:
+            participant_text, goal_on_first = first_line.split("--", 1)
+            goal = (goal_on_first + (("\n" + remainder) if separator else "")).strip()
+        else:
+            participant_text = first_line
+            goal = remainder.strip() if separator else ""
+
+        mention_ids: list[str] = []
+        participant_text = participant_text.lstrip(" \t")
+        while match := MENTION_RE.match(participant_text):
+            mention_ids.append(match.group(1))
+            participant_text = participant_text[match.end() :]
+        if participant_text.strip():
+            return "participant header must contain only mentions"
+        if not goal:
+            return "goal must not be empty"
+        return mention_ids, goal
+
+    def _stop(self, state: DiscussionState) -> Transition:
+        state.phase = "stopped"
+        state.closing_remaining.clear()
+        state.invalidation_version += 1
+        state.in_flight = None
+        state.pending_result = None
+        return Transition(True, "stopped", "discussion invalidated")
+
+    def _suspend(self, state: DiscussionState, reason: str) -> Transition:
+        state.phase = "suspended"
+        state.suspension_reason = reason
+        state.invalidation_version += 1
+        state.in_flight = None
+        state.pending_result = None
+        return Transition(False, "suspended", reason)
+
+    @staticmethod
+    def _validate_current_token(
+        state: DiscussionState, token: DispatchToken
+    ) -> Transition | None:
+        if state.in_flight != token:
+            if token.invalidation_version != state.invalidation_version:
+                return Transition(False, "invalidated", "late result cannot change state")
+            return Transition(False, "ignored", "dispatch token is not current")
+        if (
+            token.invalidation_version != state.invalidation_version
+            or state.phase not in {"active", "closing-check"}
+            or token.phase != state.phase
+        ):
+            return Transition(False, "invalidated", "late result cannot change state")
+        return None
+
+    def _eligible(self, state: DiscussionState, agent_id: str) -> bool:
+        participant = self._participants[agent_id]
+        return (
+            participant.enabled
+            and participant.available
+            and state.quotas[agent_id].can_dispatch()
+        )
+
+    @staticmethod
+    def _after(items: tuple[str, ...], item: str) -> list[str]:
+        index = items.index(item)
+        return list(items[index + 1 :] + items[: index + 1])
+
+    @staticmethod
+    def _validate_result(status: ResultStatus, text: str) -> None:
+        if status not in {"continue", "complete", "abstain"}:
+            raise ValueError(f"invalid result status: {status}")
+        if status in {"continue", "complete"} and not text.strip():
+            raise ValueError(f"{status} requires non-empty text")
+        if status == "abstain" and text:
+            raise ValueError("abstain must not include text")
