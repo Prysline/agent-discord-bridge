@@ -8,7 +8,7 @@
 
 - Codex：已遷入既有、通過測試的 Discord bridge 與 persistent adapter core。
 - Antigravity：尚未遷入；既有 fork 仍是唯讀遷移來源。
-- 共用 conversation policy：尚未合併。兩份來源實作的狀態模型不同，會先建立明確契約與回歸測試，再抽成共用模組。
+- 共用 conversation policy：已建立獨立模組與 contract tests，但尚未接上 Codex production 入口；Antigravity adapter 也尚未遷入。
 - Claude Code：未 bundled、未驗證；未來可依公開 adapter contract 由有環境者提交 PR。
 
 目前根目錄程式仍代表 Codex migration baseline。它可以用來驗證既有行為，但目錄結構不是最終公開 API。
@@ -28,6 +28,7 @@
 - `bot.py`：Discord 與 Codex app-server 橋接程式。
 - `conversation_policy.py`：目前 Codex 版的 allowlist、提及／回覆與 peer turn limiter。
 - `codex_adapter/`：persistent shared-lane adapter core。
+- `agent_bridge/conversation_policy.py`：尚未接線的共用 `human-turn`／`bounded-discussion` 契約。
 - `tests/`：routing policy 與 Codex adapter tests。
 - `shared_workspace/`：預設隔離工作目錄說明。
 

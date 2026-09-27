@@ -8,4 +8,4 @@ Copyright (c) 2026 wuguofish
 
 本次遷移保留原始 `LICENSE` 全文，但不複製來源 repository 的 Git 歷史、提交者電子郵件、本機設定或未追蹤檔案。
 
-`Prysline/antigravity-dc-bot` 目前只作後續 adapter 遷移來源；其尚未提交的本機工作樹不包含在本次初始快照中。
+共用 conversation policy 取自 `Prysline/antigravity-dc-bot` 的本機通用化草稿，並在本 repo 以獨立 contract tests 固定產品規則。其餘 Antigravity adapter 工作樹尚未遷入。
