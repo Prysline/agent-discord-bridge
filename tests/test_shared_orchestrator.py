@@ -349,20 +349,20 @@ class SharedOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome[0].action, "binding-unavailable")
         self.assertEqual(adapter.requests, [])
 
-    async def test_missing_discussion_binding_suspends_without_implicit_creation(self):
+    async def test_missing_discussion_binding_rejects_before_dispatch(self):
         adapter = FakeAdapter()
         core = self.make_core(
             {"a": adapter, "b": FakeAdapter()},
             bindings={("room", "b"): BindingSnapshot("binding-b", 1)},
         )
-        core.ingest_human(
+        outcome = core.ingest_human(
             "room", author_id="h", display_name="H", text="!discuss <@1> <@2>\ngoal"
         )
-        outcome = await core.run_discussion_turn("room")
         self.assertEqual(outcome.action, "binding-unavailable")
-        self.assertEqual(core.policy.state("room").phase, "suspended")
+        self.assertEqual(core.policy.state("room").phase, "stopped")
         self.assertEqual(core.policy.state("room").quotas["a"].used_calls, 0)
-        self.assertEqual(core.policy.state("room").safety.dispatched_calls, 1)
+        self.assertEqual(core.policy.state("room").safety.dispatched_calls, 0)
+        self.assertFalse(core.log.events("room"))
         self.assertEqual(adapter.requests, [])
 
     async def test_adapter_binding_rejection_does_not_charge_model_call(self):

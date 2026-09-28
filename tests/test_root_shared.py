@@ -4,11 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_bridge import ConversationPolicy
+from agent_bridge import ConversationPolicy, Participant
 from agent_bridge.discord_delivery import DiscordRoomDelivery
 from agent_bridge.orchestrator import BindingSnapshot, SharedOrchestrator
 from agent_bridge.root_shared import RootSharedHumanTurn, safe_failure_message
-from codex_adapter.root_composition import compose_existing_codex_root
+from codex_adapter.root_composition import (
+    compose_existing_codex_root,
+    parse_root_discussion_settings,
+)
+from codex_adapter.app_server import AppServerRpcError
 
 
 class FakeAdapter:
@@ -25,6 +29,51 @@ class FakeAdapter:
 
     async def cancel(self, request_id):
         return None
+
+
+class BlockingAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = []
+
+    async def execute(self, request, *, observer):
+        self.requests.append(request)
+        await observer.on_invocation_started(request["requestId"], "confirmed")
+        self.entered.set()
+        await self.release.wait()
+        return {"requestId": request["requestId"], "contextCommit": "committed", "status": "continue", "text": "late"}
+
+    async def cancel(self, request_id):
+        self.cancelled.append(request_id)
+
+
+class InvalidNativeClient:
+    def __init__(self):
+        self.start_calls = []
+
+    async def connect(self):
+        return None
+
+    async def reconnect(self):
+        return None
+
+    async def resume_thread(self, thread_id):
+        raise AppServerRpcError(-32000, "invalid existing thread")
+
+    async def start_turn(self, thread_id, text, client_user_message_id):
+        self.start_calls.append((thread_id, client_user_message_id))
+        raise AssertionError("invalid native mapping must not create or start a turn")
+
+    async def wait_for_turn(self, turn_id, timeout_ms):
+        raise AssertionError("no turn should exist")
+
+    async def list_turns(self, thread_id):
+        return []
+
+    async def interrupt(self, thread_id, turn_id):
+        return {}
 
 
 class FakeDelivery:
@@ -67,6 +116,31 @@ def runtime(adapter=None, delivery=None, bindings=None):
     return RootSharedHumanTurn(core, "agent-a"), adapter, delivery
 
 
+def discussion_runtime(*, delivery=None, bindings=None, adapters=None, maximum=3):
+    participants = [
+        Participant("agent-a", "101", 2000, 5),
+        Participant("agent-b", "202", 2000, 5),
+    ]
+    adapters = adapters or {"agent-a": FakeAdapter(), "agent-b": FakeAdapter()}
+    delivery = delivery or FakeDelivery()
+    request_ids = iter(f"request-{index}" for index in range(1, 20))
+    core = SharedOrchestrator(
+        policy=ConversationPolicy(participants, global_max_dispatches=maximum),
+        adapters=adapters,
+        bindings=(
+            {
+                ("room-1", "agent-a"): BindingSnapshot("binding-a", 7),
+                ("room-1", "agent-b"): BindingSnapshot("binding-b", 4),
+            }
+            if bindings is None
+            else bindings
+        ),
+        delivery=delivery,
+        request_id_factory=lambda: next(request_ids),
+    )
+    return RootSharedHumanTurn(core, "agent-a"), adapters, delivery
+
+
 class RootSharedHumanTurnTests(unittest.TestCase):
     def test_authorized_human_uses_configured_agent_and_event_delta(self):
         bridge, adapter, delivery = runtime()
@@ -87,12 +161,81 @@ class RootSharedHumanTurnTests(unittest.TestCase):
             self.assertFalse(bridge.core.log.events("room-1"))
             self.assertIn(result.action, {"unauthorized", "peer-ignored"})
 
-    def test_controls_are_unavailable_in_human_turn_slice(self):
-        bridge, adapter, _ = runtime()
-        for text in ("!discuss <@1> <@2> -- goal", "!stop"):
-            result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text=text, mentions_agent=True))
-            self.assertEqual(result.action, "control-unavailable")
-        self.assertFalse(adapter.requests)
+    def test_authorized_discussion_uses_core_order_and_bounded_mode(self):
+        bridge, adapters, delivery = discussion_runtime(maximum=2)
+        started = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- compare", mentions_agent=True))
+        outcomes = asyncio.run(bridge.drive_discussion("room-1"))
+        self.assertEqual(started.action, "started")
+        self.assertEqual([call[1] for call in delivery.calls], ["agent-a", "agent-b"])
+        self.assertEqual(adapters["agent-a"].requests[0]["mode"], "bounded-discussion")
+        self.assertEqual(adapters["agent-b"].requests[0]["discussion"]["turnIndex"], 2)
+        self.assertEqual(outcomes[-1].action, "suspended")
+
+    def test_discussion_keeps_start_binding_snapshot(self):
+        bridge, adapters, _ = discussion_runtime(maximum=2)
+        asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- snapshot", mentions_agent=True))
+        bridge.core.bindings[("room-1", "agent-b")] = BindingSnapshot("binding-b-new", 9)
+        asyncio.run(bridge.drive_discussion("room-1"))
+        self.assertEqual(adapters["agent-b"].requests[0]["binding"], {"bindingId": "binding-b", "generation": 4})
+
+    def test_human_intervention_is_context_not_parallel_human_turn(self):
+        bridge, adapters, _ = discussion_runtime(maximum=1)
+        asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- topic", mentions_agent=True))
+        intervention = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="one more constraint", mentions_agent=True))
+        self.assertEqual(intervention.action, "discussion-context")
+        self.assertFalse(adapters["agent-a"].requests)
+        asyncio.run(bridge.drive_discussion("room-1"))
+        texts = [event["text"] for event in adapters["agent-a"].requests[0]["context"]["events"]]
+        self.assertIn("one more constraint", texts)
+
+    def test_missing_participant_binding_rejects_whole_start(self):
+        bindings = {("room-1", "agent-a"): BindingSnapshot("binding-a", 7)}
+        bridge, adapters, _ = discussion_runtime(bindings=bindings)
+        result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- missing", mentions_agent=True))
+        self.assertEqual(result.action, "binding-unavailable")
+        self.assertFalse(bridge.core.log.events("room-1"))
+        self.assertFalse(adapters["agent-a"].requests)
+        self.assertFalse(adapters["agent-b"].requests)
+
+    def test_stop_uses_core_lifecycle_and_prevents_new_turn(self):
+        bridge, adapters, _ = discussion_runtime(maximum=3)
+        asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- stop", mentions_agent=True))
+        stop = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!stop", mentions_agent=True))
+        outcomes = asyncio.run(bridge.drive_discussion("room-1"))
+        self.assertEqual(stop.action, "stopped")
+        self.assertFalse(outcomes)
+        self.assertFalse(adapters["agent-a"].requests)
+        self.assertEqual(bridge.core.policy.state("room-1").phase, "stopped")
+
+    def test_stop_during_root_driver_cancels_and_late_result_cannot_continue(self):
+        async def run():
+            blocker = BlockingAdapter()
+            other = FakeAdapter()
+            bridge, _, delivery = discussion_runtime(adapters={"agent-a": blocker, "agent-b": other})
+            await bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- interrupt", mentions_agent=True)
+            driver = asyncio.create_task(bridge.drive_discussion("room-1"))
+            await blocker.entered.wait()
+            stopped = await bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!stop", mentions_agent=True)
+            blocker.release.set()
+            outcomes = await driver
+            self.assertEqual(stopped.action, "stopped")
+            self.assertEqual(len(blocker.cancelled), 1)
+            self.assertFalse(other.requests)
+            self.assertFalse(delivery.calls)
+            self.assertEqual(bridge.core.policy.state("room-1").phase, "stopped")
+            self.assertEqual(outcomes[-1].action, "invalidated")
+        asyncio.run(run())
+
+    def test_unknown_delivery_survives_stop_and_blocks_restart(self):
+        bridge, _, _ = discussion_runtime(delivery=FakeDelivery("unknown"))
+        asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- fence", mentions_agent=True))
+        outcomes = asyncio.run(bridge.drive_discussion("room-1"))
+        stopped = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!stop", mentions_agent=True))
+        restarted = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- again", mentions_agent=True))
+        self.assertEqual(outcomes[-1].action, "delivery-unknown")
+        self.assertEqual(stopped.action, "stopped")
+        self.assertEqual(restarted.action, "rejected")
+        self.assertEqual(restarted.outcomes[0].reason, "delivery pending")
 
     def test_missing_binding_fails_closed_without_adapter_execution(self):
         bridge, adapter, _ = runtime(bindings={})
@@ -140,6 +283,49 @@ class RootCompositionTests(unittest.TestCase):
             path.write_text(json.dumps(raw), encoding="utf-8")
             bridge = compose_existing_codex_root(binding_path=path, agent_id="agent-a", client=object(), delivery=FakeDelivery(), display_name="Agent")
         self.assertEqual(bridge.core.bindings[("room-1", "agent-a")], BindingSnapshot("binding-a", 7))
+
+    def test_discussion_config_and_composition_include_all_existing_participants(self):
+        config = {"sharedDiscussion": {"globalMaxDispatches": 6, "participants": [
+            {"agentId": "agent-a", "mentionId": "101", "displayName": "A", "budgetChars": 1000, "maxCalls": 2},
+            {"agentId": "agent-b", "mentionId": "202", "displayName": "B", "budgetChars": 1200, "maxCalls": 3},
+        ]}}
+        settings = parse_root_discussion_settings(config)
+        raw = {"logicalBindings": [
+            {"roomId": "room-1", "agentId": "agent-a", "bindingId": "binding-a", "generations": [7], "activeGeneration": 7},
+            {"roomId": "room-1", "agentId": "agent-b", "bindingId": "binding-b", "generations": [4], "activeGeneration": 4},
+        ], "codexBindings": [
+            {"bindingId": "binding-a", "generation": 7, "threadId": "thread-a"},
+            {"bindingId": "binding-b", "generation": 4, "threadId": "thread-b"},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            bridge = compose_existing_codex_root(binding_path=path, agent_id="agent-a", client=object(), delivery=FakeDelivery(), display_name="A", participants=list(settings.participants), participant_display_names=dict(settings.display_names), global_max_dispatches=settings.global_max_dispatches)
+        self.assertEqual(bridge.core.policy.global_max_dispatches, 6)
+        self.assertEqual(bridge.core.bindings[("room-1", "agent-b")], BindingSnapshot("binding-b", 4))
+
+    def test_invalid_native_thread_fails_closed_without_turn_creation(self):
+        settings = parse_root_discussion_settings({"sharedDiscussion": {"globalMaxDispatches": 2, "participants": [
+            {"agentId": "agent-a", "mentionId": "101", "budgetChars": 1000, "maxCalls": 2},
+            {"agentId": "agent-b", "mentionId": "202", "budgetChars": 1000, "maxCalls": 2},
+        ]}})
+        raw = {"logicalBindings": [
+            {"roomId": "room-1", "agentId": "agent-a", "bindingId": "binding-a", "generations": [1], "activeGeneration": 1},
+            {"roomId": "room-1", "agentId": "agent-b", "bindingId": "binding-b", "generations": [1], "activeGeneration": 1},
+        ], "codexBindings": [
+            {"bindingId": "binding-a", "generation": 1, "threadId": "invalid-a"},
+            {"bindingId": "binding-b", "generation": 1, "threadId": "invalid-b"},
+        ]}
+        client = InvalidNativeClient()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            bridge = compose_existing_codex_root(binding_path=path, agent_id="agent-a", client=client, delivery=FakeDelivery(), display_name="A", participants=list(settings.participants), global_max_dispatches=2)
+            started = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss <@101> <@202> -- invalid", mentions_agent=True))
+            outcomes = asyncio.run(bridge.drive_discussion("room-1"))
+        self.assertEqual(started.action, "started")
+        self.assertEqual(outcomes[-1].action, "not-committed")
+        self.assertFalse(client.start_calls)
 
 
 if __name__ == "__main__":

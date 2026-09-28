@@ -8,7 +8,7 @@
 
 - Codex：已遷入既有、通過測試的 Discord bridge 與 persistent adapter core。
 - Antigravity：尚未遷入；既有 fork 仍是唯讀遷移來源。
-- 共用 shared core：已依 frozen contract 建立 canonical event log、persistent event-delta cursor、human-turn／bounded-discussion orchestration、AgentResult validation 與 delivery/contextCommit fence；尚未接上 Codex production 入口，Antigravity adapter 也尚未遷入。
+- 共用 shared core：已依 frozen contract 建立 canonical event log、persistent event-delta cursor、human-turn／bounded-discussion orchestration、AgentResult validation 與 delivery/contextCommit fence；Codex root 已有 opt-in human-turn 與 bounded-discussion wiring，Antigravity adapter 尚未遷入。
 - Claude Code：未 bundled、未驗證；未來可依公開 adapter contract 由有環境者提交 PR。
 
 目前根目錄程式仍代表 Codex migration baseline。它可以用來驗證既有行為，但目錄結構不是最終公開 API。
@@ -35,7 +35,7 @@
 - `tests/`：routing policy 與 Codex adapter tests。
 - `shared_workspace/`：預設隔離工作目錄說明。
 
-Shared orchestration core 已能以 fake adapter 驗證 `continue`／`complete`／`abstain` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；本機 bootstrap 也能以 exact `bindingId + generation` 載入既有 Codex thread，但尚未接上 root `bot.py`。Codex adapter 對真實模型 final 仍只回傳 `continue`，legacy `ThreadMapStore` 仍會自動建立 thread，因此 production entry 尚未切換，不能宣稱 Discord E2E、durable restart 或端到端 `bounded-discussion` 已可使用。
+Shared orchestration core 已能以 fake adapter 驗證 `continue`／`complete`／`abstain` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；本機 bootstrap 以 exact `bindingId + generation` 載入既有 Codex thread。Opt-in human-turn root path 已完成真人 Discord E2E；bounded discussion 已接上 root，但只有自動測試，尚未完成真人 Discord E2E。Codex adapter 對真實模型 final 仍只回傳 `continue`，durable restart、完整 production rollout 與端到端 closing-check 仍未完成。
 
 ## 本機設定
 
@@ -53,7 +53,7 @@ python -m pip install -r requirements.txt
 
 `bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID 只存在 adapter-local resolver。設定矛盾會在 bootstrap 時拒絕載入，不會建立或替換 thread。真實 Token、numeric ID、native thread ID 與 persona 不得提交。
 
-設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 會使用 bootstrap existing binding、shared canonical event-delta 與 `CodexPersistentAdapter`；此模式不讀 Discord recent history、不建立 thread，也不在失敗時 fallback legacy execution。目前只支援單一 configured agent 與單則 Discord delivery，`!discuss`／`!stop`、peer agent 與 chunking 尚未接線。
+設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 會使用 bootstrap existing binding、shared canonical event-delta 與 `CodexPersistentAdapter`；此模式不讀 Discord recent history、不建立 thread，也不在失敗時 fallback legacy execution。`config.json` 的 `sharedDiscussion` 明確列出可參與 `!discuss` 的 Discord mention、logical `agentId`、個別字元／呼叫額度與 unattended dispatch hard limit；每位 participant 都必須在 `bindings.local.json` 有 existing binding。`!stop` 會進 shared stop lifecycle，root 不另寫 cancellation semantics。目前仍只支援單則 Discord delivery，peer ingestion、chunking 與 durable persistence 尚未接線。
 
 ## 驗證
 
@@ -63,7 +63,7 @@ python -m unittest discover -s tests -v
 git diff --check
 ```
 
-自動測試不會登入 Discord，也不會使用真實 Token。正式接上 Discord 前仍需另外完成 adapter wiring、delivery 與端到端人工驗收。
+自動測試不會登入 Discord，也不會使用真實 Token。Human-turn root path 已完成一次真人 Manual E2E；bounded discussion 與 `!stop` 仍需使用真實 participant bindings 另做 Manual E2E，不能由本機測試推定完成。
 
 ## 授權與來源
 

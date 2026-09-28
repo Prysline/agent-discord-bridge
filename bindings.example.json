@@ -2,17 +2,29 @@
   "logicalBindings": [
     {
       "roomId": "ROOM_PLACEHOLDER",
-      "agentId": "AGENT_PLACEHOLDER",
-      "bindingId": "BINDING_PLACEHOLDER",
+      "agentId": "AGENT_A",
+      "bindingId": "BINDING_A",
       "generations": [7],
       "activeGeneration": 7
+    },
+    {
+      "roomId": "ROOM_PLACEHOLDER",
+      "agentId": "AGENT_B",
+      "bindingId": "BINDING_B",
+      "generations": [3],
+      "activeGeneration": 3
     }
   ],
   "codexBindings": [
     {
-      "bindingId": "BINDING_PLACEHOLDER",
+      "bindingId": "BINDING_A",
       "generation": 7,
-      "threadId": "EXISTING_CODEX_THREAD_PLACEHOLDER"
+      "threadId": "EXISTING_CODEX_THREAD_A"
+    },
+    {
+      "bindingId": "BINDING_B",
+      "generation": 3,
+      "threadId": "EXISTING_CODEX_THREAD_B"
     }
   ]
 }

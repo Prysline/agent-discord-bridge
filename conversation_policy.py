@@ -12,6 +12,7 @@ class MessageEnvelope:
     is_dm: bool
     mentions_bot: bool
     replies_to_bot: bool
+    is_control_command: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,11 @@ def decide_access(config: dict, message: MessageEnvelope) -> AccessDecision:
         return AccessDecision(False, reason="human not allowed")
 
     if channel_policy.get("requireMention", True):
-        if not (message.mentions_bot or message.replies_to_bot):
+        if not (
+            message.mentions_bot
+            or message.replies_to_bot
+            or message.is_control_command
+        ):
             return AccessDecision(False, reason="mention required")
 
     return AccessDecision(True, reason="allowed human message")

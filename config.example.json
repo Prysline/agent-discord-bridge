@@ -5,6 +5,25 @@
     "contextMessages": 12,
     "maxPeerTurns": 2
   },
+  "sharedDiscussion": {
+    "globalMaxDispatches": 10,
+    "participants": [
+      {
+        "agentId": "AGENT_A",
+        "mentionId": "AGENT_A_DISCORD_BOT_ID",
+        "displayName": "Agent A",
+        "budgetChars": 2000,
+        "maxCalls": 5
+      },
+      {
+        "agentId": "AGENT_B",
+        "mentionId": "AGENT_B_DISCORD_BOT_ID",
+        "displayName": "Agent B",
+        "budgetChars": 2000,
+        "maxCalls": 5
+      }
+    ]
+  },
   "channels": {
     "PRIVATE_CHANNEL_ID": {
       "name": "private-room",

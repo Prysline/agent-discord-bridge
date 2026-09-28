@@ -26,7 +26,10 @@ from codex_adapter.app_server import (
     CodexAppServerClient as SharedCodexAppServerClient,
     StdioTransport as SharedStdioTransport,
 )
-from codex_adapter.root_composition import compose_existing_codex_root
+from codex_adapter.root_composition import (
+    compose_existing_codex_root,
+    parse_root_discussion_settings,
+)
 
 from conversation_policy import (
     AccessDecision,
@@ -120,6 +123,12 @@ def access_decision(message: discord.Message) -> AccessDecision:
             is_dm=isinstance(message.channel, discord.DMChannel),
             mentions_bot=any(u.id == BOT_USER_ID for u in message.mentions),
             replies_to_bot=replies_to_bot,
+            is_control_command=(
+                SHARED_CORE_ENABLED
+                and shared_root is not None
+                and shared_root.core.policy.classify_control(message.content or "")
+                is not None
+            ),
         ),
     )
 
@@ -889,12 +898,16 @@ if SHARED_CORE_ENABLED:
     shared_app_client = SharedCodexAppServerClient(
         lambda: SharedStdioTransport(shared_command, CODEX_CWD)
     )
+    shared_discussion = parse_root_discussion_settings(CONFIG)
     shared_root = compose_existing_codex_root(
         binding_path=SHARED_BINDINGS_PATH,
         agent_id=SHARED_AGENT_ID,
         client=shared_app_client,
         delivery=shared_delivery,
         display_name=BOT_DISPLAY_NAME,
+        participants=list(shared_discussion.participants),
+        participant_display_names=dict(shared_discussion.display_names),
+        global_max_dispatches=shared_discussion.global_max_dispatches,
         timeout_ms=(CODEX_TURN_TIMEOUT_SEC * 1000 if CODEX_TURN_TIMEOUT_SEC else 120_000),
     )
 
@@ -970,12 +983,51 @@ intents.dm_messages = True
 client = discord.Client(intents=intents)
 
 channel_locks: dict[int, asyncio.Lock] = {}
+shared_discussion_tasks: dict[str, asyncio.Task] = {}
 
 
 def get_lock(channel_id: int) -> asyncio.Lock:
     if channel_id not in channel_locks:
         channel_locks[channel_id] = asyncio.Lock()
     return channel_locks[channel_id]
+
+
+async def drive_shared_discussion(room_id: str, channel) -> None:
+    """Drive core-owned discussion turns without holding the Discord ingress lock."""
+    assert shared_root is not None
+    try:
+        outcomes = await shared_root.drive_discussion(room_id)
+        if not outcomes:
+            return
+        final = outcomes[-1]
+        if final.action == "completed":
+            await channel.send("討論已完成。")
+        elif final.action in {
+            "binding-unavailable",
+            "context-unknown",
+            "delivery-unknown",
+            "not-committed",
+            "invalid-response",
+            "adapter-error",
+            "suspended",
+        }:
+            await channel.send("討論已暫停，這次不會改走舊流程重試。")
+    except Exception:
+        log.exception("shared bounded discussion 發生未預期錯誤")
+    finally:
+        current = asyncio.current_task()
+        if shared_discussion_tasks.get(room_id) is current:
+            shared_discussion_tasks.pop(room_id, None)
+
+
+def start_shared_discussion(room_id: str, channel) -> bool:
+    current = shared_discussion_tasks.get(room_id)
+    if current is not None and not current.done():
+        return False
+    shared_discussion_tasks[room_id] = asyncio.create_task(
+        drive_shared_discussion(room_id, channel)
+    )
+    return True
 
 
 async def send_backend_failure_reply(message: discord.Message, error_message: str | None) -> None:
@@ -1120,6 +1172,16 @@ async def on_message(message: discord.Message):
         shared_delivery.register(room_id, message.channel)
         lock = get_lock(message.channel.id)
         async with lock:
+            control = shared_root.core.policy.classify_control(message.content or "")
+            active_driver = shared_discussion_tasks.get(room_id)
+            if (
+                control == "start"
+                and active_driver is not None
+                and not active_driver.done()
+            ):
+                await message.channel.send("上一場討論仍在停止或收尾，請稍後重新發起。")
+                await safe_add_reaction(message, "⚠️")
+                return
             await safe_add_reaction(message, "⏳")
             try:
                 async with message.channel.typing():
@@ -1139,8 +1201,18 @@ async def on_message(message: discord.Message):
             finally:
                 await safe_remove_reaction(message, "⏳")
 
-            if result is not None and result.action == "control-unavailable":
-                await message.channel.send("目前 shared 模式尚未啟用討論控制指令。")
+            if result is not None and result.action == "started":
+                start_shared_discussion(room_id, message.channel)
+                await safe_add_reaction(message, "✅")
+                return
+            if result is not None and result.action == "stopped":
+                await safe_add_reaction(message, "✅")
+                return
+            if result is not None and result.action == "discussion-context":
+                await safe_add_reaction(message, "✅")
+                return
+            if result is not None and result.action == "rejected":
+                await message.channel.send("討論指令無效，或目前已有討論正在進行。")
                 await safe_add_reaction(message, "⚠️")
                 return
             failure = safe_failure_message(result.outcomes) if result is not None else "後台這次沒有完成回覆。"

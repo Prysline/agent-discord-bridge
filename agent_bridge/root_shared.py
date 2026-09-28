@@ -36,10 +36,21 @@ class RootSharedHumanTurn:
             return RootHumanTurnResult("unauthorized")
         if is_peer:
             return RootHumanTurnResult("peer-ignored")
-        if self.core.policy.classify_control(text) is not None:
-            return RootHumanTurnResult("control-unavailable")
+        control = self.core.policy.classify_control(text)
+        if control == "start":
+            outcome = self.core.ingest_human(
+                room_id,
+                author_id=author_id,
+                display_name=display_name,
+                text=text,
+                timestamp=timestamp,
+            )
+            return RootHumanTurnResult(outcome.action, (outcome,))
+        if control == "stop":
+            outcome = await self.core.stop(room_id, author_id)
+            return RootHumanTurnResult(outcome.action, (outcome,))
 
-        self.core.ingest_human(
+        outcome = self.core.ingest_human(
             room_id,
             author_id=author_id,
             display_name=display_name,
@@ -47,8 +58,30 @@ class RootSharedHumanTurn:
             mentioned_agents=(self.agent_id,) if mentions_agent else (),
             timestamp=timestamp,
         )
+        if self.core.policy.state(room_id).phase in {"active", "closing-check"}:
+            return RootHumanTurnResult("discussion-context", (outcome,))
         outcomes = await self.core.run_human_turn(room_id, (self.agent_id,))
         return RootHumanTurnResult("handled", tuple(outcomes))
+
+    async def drive_discussion(self, room_id: str) -> tuple[CoreOutcome, ...]:
+        """Run core-selected turns until the discussion reaches a safe stop."""
+        outcomes: list[CoreOutcome] = []
+        while self.core.policy.state(room_id).phase in {"active", "closing-check"}:
+            outcome = await self.core.run_discussion_turn(room_id)
+            outcomes.append(outcome)
+            if outcome.action in {
+                "blocked",
+                "binding-unavailable",
+                "context-unknown",
+                "delivery-unknown",
+                "not-committed",
+                "invalid-response",
+                "adapter-error",
+                "suspended",
+                "stopped",
+            }:
+                break
+        return tuple(outcomes)
 
 
 def safe_failure_message(outcomes: tuple[CoreOutcome, ...]) -> str | None:

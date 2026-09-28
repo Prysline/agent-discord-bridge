@@ -55,6 +55,27 @@ class ConversationPolicyTests(unittest.TestCase):
             ).allowed
         )
 
+    def test_authorized_shared_control_does_not_require_extra_bot_mention(self):
+        decision = decide_access(
+            CONFIG,
+            envelope(
+                mentions_bot=False,
+                replies_to_bot=False,
+                is_control_command=True,
+            ),
+        )
+        self.assertTrue(decision.allowed)
+        self.assertFalse(
+            decide_access(
+                CONFIG,
+                envelope(
+                    author_id="101",
+                    mentions_bot=False,
+                    is_control_command=True,
+                ),
+            ).allowed
+        )
+
     def test_unknown_human_is_rejected(self):
         self.assertFalse(decide_access(CONFIG, envelope(author_id="101")).allowed)
 

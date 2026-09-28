@@ -270,11 +270,20 @@ class SharedOrchestrator:
         transition = self.policy.handle_event(Event(room_id, author_id, False, text))
         if transition.action == "started":
             state = self.policy.state(room_id)
-            self._discussion_bindings[room_id] = {
+            snapshots = {
                 agent_id: binding
                 for agent_id in state.participants
                 if (binding := self.bindings.get((room_id, agent_id))) is not None
             }
+            if len(snapshots) != len(state.participants) or any(
+                agent_id not in self.adapters for agent_id in state.participants
+            ):
+                self.policy.handle_event(Event(room_id, author_id, False, "!stop"))
+                self._discussion_bindings.pop(room_id, None)
+                return CoreOutcome(
+                    "binding-unavailable", reason="participant binding unavailable"
+                )
+            self._discussion_bindings[room_id] = snapshots
             self.log.append_core(
                 room_id, core_type="discussion_started", text=state.goal
             )

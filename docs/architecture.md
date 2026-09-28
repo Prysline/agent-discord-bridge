@@ -32,7 +32,7 @@ Discord ingress
 
 `agent_bridge/contracts.py` 是 wiring 使用的 shared request／result validator；`codex_adapter/contracts.py` 保留 Codex result helpers，但重用同一份 shared AgentRequest validation，避免 schema 漂移。
 
-這些元件尚未持久化。Root Discord entry 已有 opt-in 的單一 configured agent human-turn path；discussion、peer ingestion 與完整 production cutover 尚未接線。
+這些元件尚未持久化。Root Discord entry 已有 opt-in human-turn 與 bounded-discussion driver；driver 只反覆呼叫 shared core 選出的合法 turn，並讓 `!stop` 在 in-flight request 期間進入既有 stop／reconciliation lifecycle。Participant、quota 與 exact existing binding 由本機設定提供，root 不另建 scheduler。Peer ingestion、durable restart 與完整 production cutover仍未接線；bounded discussion 也尚未完成真人 Discord E2E。
 
 ## Shared conversation policy
 
@@ -53,8 +53,8 @@ Discord ingress
 
 1. 以已提交且完成 Phase 1.5 驗證的 Codex 程式建立乾淨基線。
 2. 為 shared conversation policy 補上 frozen contract state machine 與回歸測試。（已完成）
-3. 建立 canonical log、event-delta cursor、shared contracts 與 orchestrator wiring target。（已完成本機 memory-only core；production entry pending）
-4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，再將 Codex Discord human-turn 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。
+3. 建立 canonical log、event-delta cursor、shared contracts 與 orchestrator wiring target。（已完成 memory-only core）
+4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，將 Codex Discord human-turn 與 bounded-discussion root 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。（本機 wiring 已完成；bounded discussion Manual E2E pending）
 5. 對 Antigravity 未提交工作樹做獨立測試與敏感資料檢查，再遷入 adapter。
 6. 兩個 adapter 均通過共用 contract tests 後，才處理舊 fork 的退場或薄化。
 
