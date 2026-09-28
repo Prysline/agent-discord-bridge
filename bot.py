@@ -20,6 +20,14 @@ import discord
 import websockets
 from dotenv import load_dotenv
 
+from agent_bridge.discord_delivery import DiscordRoomDelivery
+from agent_bridge.root_shared import safe_failure_message
+from codex_adapter.app_server import (
+    CodexAppServerClient as SharedCodexAppServerClient,
+    StdioTransport as SharedStdioTransport,
+)
+from codex_adapter.root_composition import compose_existing_codex_root
+
 from conversation_policy import (
     AccessDecision,
     MessageEnvelope,
@@ -47,6 +55,14 @@ CODEX_TRANSPORT = os.getenv("CODEX_TRANSPORT", "stdio").strip().lower() or "stdi
 CODEX_WS_URL = os.getenv("CODEX_WS_URL", "ws://127.0.0.1:45888").strip()
 CODEX_CONNECT_RETRIES = max(1, int(os.getenv("CODEX_CONNECT_RETRIES", "4") or "4"))
 CODEX_RETRY_BASE_SEC = max(1, int(os.getenv("CODEX_RETRY_BASE_SEC", "2") or "2"))
+SHARED_CORE_ENABLED = os.getenv("SHARED_CORE_ENABLED", "false").strip().lower() == "true"
+SHARED_AGENT_ID = os.getenv("SHARED_AGENT_ID", "").strip()
+SHARED_BINDINGS_PATH_RAW = Path(os.getenv("SHARED_BINDINGS_PATH", "bindings.local.json"))
+SHARED_BINDINGS_PATH = (
+    SHARED_BINDINGS_PATH_RAW
+    if SHARED_BINDINGS_PATH_RAW.is_absolute()
+    else BOT_DIR / SHARED_BINDINGS_PATH_RAW
+).resolve()
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "AI Companion").strip() or "AI Companion"
 PERSONA_PATH_RAW = Path(os.getenv("BOT_PERSONA_PATH", "persona.md"))
 PERSONA_PATH = (
@@ -860,6 +876,28 @@ codex_client = CodexAppServerClient(
     retry_base_sec=CODEX_RETRY_BASE_SEC,
 )
 
+shared_delivery: DiscordRoomDelivery | None = None
+shared_app_client: SharedCodexAppServerClient | None = None
+shared_root = None
+if SHARED_CORE_ENABLED:
+    if not SHARED_AGENT_ID:
+        raise RuntimeError("SHARED_AGENT_ID is required when shared core is enabled")
+    if CODEX_TRANSPORT != "stdio":
+        raise RuntimeError("shared core currently requires CODEX_TRANSPORT=stdio")
+    shared_delivery = DiscordRoomDelivery()
+    shared_command = resolve_codex_command(CODEX_PATH)
+    shared_app_client = SharedCodexAppServerClient(
+        lambda: SharedStdioTransport(shared_command, CODEX_CWD)
+    )
+    shared_root = compose_existing_codex_root(
+        binding_path=SHARED_BINDINGS_PATH,
+        agent_id=SHARED_AGENT_ID,
+        client=shared_app_client,
+        delivery=shared_delivery,
+        display_name=BOT_DISPLAY_NAME,
+        timeout_ms=(CODEX_TURN_TIMEOUT_SEC * 1000 if CODEX_TURN_TIMEOUT_SEC else 120_000),
+    )
+
 
 async def get_or_create_thread(channel_id: int) -> str:
     """取回既有 thread，失效時自動重建。"""
@@ -1046,14 +1084,22 @@ async def send_codex_reply(message: discord.Message, text: str | None) -> bool:
 async def on_ready():
     log.info(f"{BOT_DISPLAY_NAME} Listener Bot 已上線: {client.user} (ID: {client.user.id})")
     try:
-        await codex_client.ensure_started()
+        if SHARED_CORE_ENABLED:
+            assert shared_app_client is not None
+            await shared_app_client.connect()
+        else:
+            await codex_client.ensure_started()
     except Exception as exc:
         log.warning(f"Codex app-server 預熱失敗，收到訊息時會再重試: {exc}")
 
 
 @client.event
 async def on_disconnect():
-    await codex_client.close()
+    if SHARED_CORE_ENABLED:
+        assert shared_app_client is not None
+        await shared_app_client.close()
+    else:
+        await codex_client.close()
 
 
 @client.event
@@ -1064,6 +1110,48 @@ async def on_message(message: discord.Message):
 
     decision = access_decision(message)
     if not decision.allowed:
+        return
+
+    if SHARED_CORE_ENABLED:
+        if decision.is_peer:
+            return
+        assert shared_delivery is not None and shared_root is not None
+        room_id = str(message.channel.id)
+        shared_delivery.register(room_id, message.channel)
+        lock = get_lock(message.channel.id)
+        async with lock:
+            await safe_add_reaction(message, "⏳")
+            try:
+                async with message.channel.typing():
+                    result = await shared_root.handle(
+                        allowed=True,
+                        is_peer=False,
+                        room_id=room_id,
+                        author_id=str(message.author.id),
+                        display_name=message.author.display_name or message.author.name,
+                        text=message.content or "",
+                        mentions_agent=any(user.id == BOT_USER_ID for user in message.mentions),
+                        timestamp=message.created_at.isoformat(),
+                    )
+            except Exception:
+                log.exception("shared human-turn 發生未預期錯誤")
+                result = None
+            finally:
+                await safe_remove_reaction(message, "⏳")
+
+            if result is not None and result.action == "control-unavailable":
+                await message.channel.send("目前 shared 模式尚未啟用討論控制指令。")
+                await safe_add_reaction(message, "⚠️")
+                return
+            failure = safe_failure_message(result.outcomes) if result is not None else "後台這次沒有完成回覆。"
+            if failure is None:
+                await safe_add_reaction(message, "✅")
+            else:
+                await safe_add_reaction(message, "⚠️")
+                try:
+                    await message.channel.send(failure)
+                except Exception:
+                    log.warning("shared failure indication 無法送達")
         return
 
     channel_key = str(message.channel.id)

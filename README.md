@@ -53,6 +53,8 @@ python -m pip install -r requirements.txt
 
 `bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID 只存在 adapter-local resolver。設定矛盾會在 bootstrap 時拒絕載入，不會建立或替換 thread。真實 Token、numeric ID、native thread ID 與 persona 不得提交。
 
+設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 會使用 bootstrap existing binding、shared canonical event-delta 與 `CodexPersistentAdapter`；此模式不讀 Discord recent history、不建立 thread，也不在失敗時 fallback legacy execution。目前只支援單一 configured agent 與單則 Discord delivery，`!discuss`／`!stop`、peer agent 與 chunking 尚未接線。
+
 ## 驗證
 
 ```powershell

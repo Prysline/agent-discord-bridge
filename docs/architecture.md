@@ -32,7 +32,7 @@ Discord ingress
 
 `agent_bridge/contracts.py` 是 wiring 使用的 shared request／result validator；`codex_adapter/contracts.py` 保留 Codex result helpers，但重用同一份 shared AgentRequest validation，避免 schema 漂移。
 
-這些元件尚未持久化，也尚未接上 root Discord entry。
+這些元件尚未持久化。Root Discord entry 已有 opt-in 的單一 configured agent human-turn path；discussion、peer ingestion 與完整 production cutover 尚未接線。
 
 ## Shared conversation policy
 
