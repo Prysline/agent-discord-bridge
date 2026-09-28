@@ -4,7 +4,7 @@ Storage and create/rebind control-plane behavior intentionally live outside this
 """
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterable, Protocol
 
 
 class BindingUnavailable(RuntimeError):
@@ -27,6 +27,30 @@ class BindingResolver(Protocol):
 
     async def resolve(self, binding_id: str, generation: int) -> ResolvedBinding:
         """Return the exact existing binding or raise a BindingUnavailable subtype."""
+
+
+class InMemoryBindingResolver:
+    """Resolve only explicitly configured existing Codex sessions."""
+
+    def __init__(self, bindings: Iterable[ResolvedBinding]) -> None:
+        self._bindings: dict[tuple[str, int], ResolvedBinding] = {}
+        for binding in bindings:
+            if not binding.binding_id.strip() or not binding.thread_id.strip():
+                raise ValueError("binding and native thread identifiers must be non-empty")
+            if isinstance(binding.generation, bool) or not isinstance(binding.generation, int):
+                raise ValueError("binding generation must be an integer")
+            key = (binding.binding_id, binding.generation)
+            if key in self._bindings:
+                raise ValueError("duplicate exact native binding mapping")
+            self._bindings[key] = binding
+
+    async def resolve(self, binding_id: str, generation: int) -> ResolvedBinding:
+        resolved = self._bindings.get((binding_id, generation))
+        if resolved is not None:
+            return resolved
+        if any(key_binding == binding_id for key_binding, _ in self._bindings):
+            raise BindingGenerationMismatch("binding generation mismatch")
+        raise BindingUnavailable("binding is unavailable")
 
 
 async def resolve_existing(

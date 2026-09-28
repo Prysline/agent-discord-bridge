@@ -54,7 +54,7 @@ Discord ingress
 1. 以已提交且完成 Phase 1.5 驗證的 Codex 程式建立乾淨基線。
 2. 為 shared conversation policy 補上 frozen contract state machine 與回歸測試。（已完成）
 3. 建立 canonical log、event-delta cursor、shared contracts 與 orchestrator wiring target。（已完成本機 memory-only core；production entry pending）
-4. 補齊 existing binding create／rebind control plane 後，才將 Codex Discord 入口安全切換至 shared core。
+4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，再將 Codex Discord human-turn 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。
 5. 對 Antigravity 未提交工作樹做獨立測試與敏感資料檢查，再遷入 adapter。
 6. 兩個 adapter 均通過共用 contract tests 後，才處理舊 fork 的退場或薄化。
 

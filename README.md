@@ -30,11 +30,12 @@
 - `codex_adapter/`：persistent shared-lane adapter core。
 - `agent_bridge/contracts.py`：跨 adapter 的 AgentRequest／AgentResult v1 validation。
 - `agent_bridge/conversation_policy.py`：core-owned bounded-discussion scheduler、closing check、quota accounting 與 restart／stop state machine。
+- `agent_bridge/binding_control.py` 與 `agent_bridge/binding_bootstrap.py`：memory-only logical binding state 與本機 existing-binding bootstrap parser。
 - `agent_bridge/orchestrator.py`：memory-only canonical log、human-turn、discussion、cursor、delivery 與 contextCommit coordination。
 - `tests/`：routing policy 與 Codex adapter tests。
 - `shared_workspace/`：預設隔離工作目錄說明。
 
-Shared orchestration core 已能以 fake adapter 驗證 `continue`／`complete`／`abstain` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；但 Codex adapter 對真實模型 final 仍只回傳 `continue`，root `bot.py` 也仍走 legacy direct path。現有 `ThreadMapStore` 會自動建立 thread，無法提供 frozen contract 要求的 existing `bindingId + generation` gate，因此 production entry 尚未切換，不能宣稱 Discord E2E、durable restart 或端到端 `bounded-discussion` 已可使用。
+Shared orchestration core 已能以 fake adapter 驗證 `continue`／`complete`／`abstain` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；本機 bootstrap 也能以 exact `bindingId + generation` 載入既有 Codex thread，但尚未接上 root `bot.py`。Codex adapter 對真實模型 final 仍只回傳 `continue`，legacy `ThreadMapStore` 仍會自動建立 thread，因此 production entry 尚未切換，不能宣稱 Discord E2E、durable restart 或端到端 `bounded-discussion` 已可使用。
 
 ## 本機設定
 
@@ -46,10 +47,11 @@ Codex baseline 的設定方式：
 Copy-Item .env.example .env
 Copy-Item config.example.json config.json
 Copy-Item persona.example.md persona.md
+Copy-Item bindings.example.json bindings.local.json
 python -m pip install -r requirements.txt
 ```
 
-真實 Token、numeric ID 與 persona 不得提交。
+`bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID 只存在 adapter-local resolver。設定矛盾會在 bootstrap 時拒絕載入，不會建立或替換 thread。真實 Token、numeric ID、native thread ID 與 persona 不得提交。
 
 ## 驗證
 

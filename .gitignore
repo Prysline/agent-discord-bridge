@@ -10,3 +10,4 @@ temp/
 # Private runtime config — copy from the tracked examples.
 config.json
 persona.md
+bindings.local.json

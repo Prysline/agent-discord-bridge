@@ -1,0 +1,18 @@
+{
+  "logicalBindings": [
+    {
+      "roomId": "ROOM_PLACEHOLDER",
+      "agentId": "AGENT_PLACEHOLDER",
+      "bindingId": "BINDING_PLACEHOLDER",
+      "generations": [7],
+      "activeGeneration": 7
+    }
+  ],
+  "codexBindings": [
+    {
+      "bindingId": "BINDING_PLACEHOLDER",
+      "generation": 7,
+      "threadId": "EXISTING_CODEX_THREAD_PLACEHOLDER"
+    }
+  ]
+}
