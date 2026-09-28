@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
+from agent_bridge.contracts import InvocationCertainty, InvocationObserver
+
 from .app_server import (
     AppServerError,
     AppServerMethodUnsupported,
@@ -82,7 +84,12 @@ class CodexPersistentAdapter:
         self._terminal_results: dict[str, dict[str, Any]] = {}
         self._cancelled_requests: set[str] = set()
 
-    async def execute(self, raw_request: Mapping[str, Any]) -> dict[str, Any]:
+    async def execute(
+        self,
+        raw_request: Mapping[str, Any],
+        *,
+        observer: InvocationObserver | None = None,
+    ) -> dict[str, Any]:
         request_id = raw_request.get("requestId") if isinstance(raw_request, Mapping) else None
         if not isinstance(request_id, str) or not request_id:
             raise ContractError("requestId is required before an AgentResult can be correlated")
@@ -134,7 +141,7 @@ class CodexPersistentAdapter:
 
         result: dict[str, Any] | None = None
         try:
-            result = await self._execute_reserved(request)
+            result = await self._execute_reserved(request, observer)
             result = await self._apply_delivery_fences(request, result)
             return result
         except asyncio.CancelledError:
@@ -172,7 +179,9 @@ class CodexPersistentAdapter:
                     if result is None or result.get("contextCommit") != "unknown":
                         self._active = None
 
-    async def _execute_reserved(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def _execute_reserved(
+        self, request: dict[str, Any], observer: InvocationObserver | None
+    ) -> dict[str, Any]:
         request_id = request["requestId"]
         binding = request["binding"]
         try:
@@ -260,6 +269,7 @@ class CodexPersistentAdapter:
                 self.client.start_turn(resolved.thread_id, prompt, request_id),
                 timeout=_remaining_seconds(deadline),
             )
+            await self._notify_invocation(observer, request_id, "confirmed")
             turn_id = reference.turn_id
             async with self._state_lock:
                 if self._active and self._active.request_id == request_id:
@@ -273,6 +283,7 @@ class CodexPersistentAdapter:
                     dispatch_confirmed=True,
                 )
         except asyncio.TimeoutError:
+            await self._notify_invocation(observer, request_id, "ambiguous")
             return await self._recover_result(
                 request,
                 resolved.thread_id,
@@ -299,6 +310,7 @@ class CodexPersistentAdapter:
                 "turn_start",
             )
         except (AppServerTransportError, AppServerProtocolError):
+            await self._notify_invocation(observer, request_id, "ambiguous")
             return await self._recover_result(
                 request,
                 resolved.thread_id,
@@ -348,6 +360,15 @@ class CodexPersistentAdapter:
                 False,
                 "turn_wait",
             )
+
+    @staticmethod
+    async def _notify_invocation(
+        observer: InvocationObserver | None,
+        request_id: str,
+        certainty: InvocationCertainty,
+    ) -> None:
+        if observer is not None:
+            await observer.on_invocation_started(request_id, certainty)
 
     async def _binding_matches(self, request: dict[str, Any], thread_id: str) -> bool:
         binding = request["binding"]

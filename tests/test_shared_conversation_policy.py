@@ -30,6 +30,7 @@ def start(value, content="!discuss <@101> <@102> -- goal"):
 
 
 def finish(value, channel, token, *, status, text="", delivery="delivered"):
+    value.record_invocation_started(channel, token)
     recorded = value.record_result(channel, token, status=status, text=text)
     if not recorded.accepted:
         return recorded
@@ -254,11 +255,18 @@ class SharedConversationPolicyTests(unittest.TestCase):
         self.assertIn(result.action, {"ignored", "invalidated"})
         self.assertEqual(value.state("room").phase, "active")
 
-    def test_per_agent_call_accounting_happens_on_begin(self):
+    def test_per_agent_call_accounting_happens_on_invocation_signal_once(self):
         value = policy()
         start(value)
         begun = value.begin_dispatch("room")
+        self.assertEqual(value.state("room").quotas[begun.agent_id].used_calls, 0)
+        self.assertEqual(value.state("room").safety.dispatched_calls, 1)
+        first = value.record_invocation_started("room", begun.token)
+        duplicate = value.record_invocation_started("room", begun.token)
+        self.assertEqual(first.action, "invocation-recorded")
+        self.assertEqual(duplicate.action, "invocation-already-recorded")
         self.assertEqual(value.state("room").quotas[begun.agent_id].used_calls, 1)
+        self.assertEqual(value.state("room").safety.dispatched_calls, 1)
 
     def test_only_last_speaker_eligible_suspends(self):
         value = policy([

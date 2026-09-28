@@ -4,6 +4,7 @@ import unittest
 from codex_adapter.app_server import (
     AppServerMethodUnsupported,
     AppServerProtocolError,
+    AppServerRpcError,
     AppServerTransportError,
     CodexAppServerClient,
     TurnReference,
@@ -114,6 +115,7 @@ class FakeClient:
         self.connect_calls = 0
         self.reconnect_calls = 0
         self.resume_calls = []
+        self.resume_outcome = None
         self.start_calls = []
         self.interrupt_calls = []
         self.interrupt_outcome = {}
@@ -130,6 +132,8 @@ class FakeClient:
 
     async def resume_thread(self, thread_id):
         self.resume_calls.append(thread_id)
+        if isinstance(self.resume_outcome, Exception):
+            raise self.resume_outcome
         return {"thread": {"id": thread_id}}
 
     async def start_turn(self, thread_id, text, client_user_message_id):
@@ -163,6 +167,14 @@ class FakeClient:
         return self.interrupt_outcome
 
 
+class RecordingInvocationObserver:
+    def __init__(self):
+        self.signals = []
+
+    async def on_invocation_started(self, request_id, certainty):
+        self.signals.append((request_id, certainty))
+
+
 class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_capabilities_match_persistent_phase_one_contract(self):
         self.assertEqual(
@@ -185,6 +197,48 @@ class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["contextCommit"], "not_committed")
         self.assertEqual(resolver.calls, [])
         self.assertEqual(client.start_calls, [])
+
+    async def test_pre_start_failures_emit_no_invocation_signal(self):
+        cases = []
+
+        invalid = request()
+        invalid["constraints"]["timeoutMs"] = 0
+        cases.append((invalid, FakeClient(), FakeResolver()))
+        cases.append((request(), FakeClient(), FakeResolver(BindingUnavailable("missing"))))
+        cases.append(
+            (request(), FakeClient(), FakeResolver(BindingGenerationMismatch("changed")))
+        )
+        resume_failure = FakeClient()
+        resume_failure.resume_outcome = AppServerRpcError(-32000, "resume rejected")
+        cases.append((request(), resume_failure, FakeResolver()))
+        rejected_start = FakeClient()
+        rejected_start.start_outcome = AppServerRpcError(-32000, "turn rejected")
+        cases.append((request(), rejected_start, FakeResolver()))
+
+        for raw, client, resolver in cases:
+            with self.subTest(client=type(client).__name__, resolver=type(resolver).__name__):
+                observer = RecordingInvocationObserver()
+                await CodexPersistentAdapter(client, resolver).execute(raw, observer=observer)
+                self.assertEqual(observer.signals, [])
+
+    async def test_successful_start_emits_one_confirmed_invocation_signal(self):
+        observer = RecordingInvocationObserver()
+        result = await CodexPersistentAdapter(FakeClient(), FakeResolver()).execute(
+            request(), observer=observer
+        )
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(observer.signals, [(REQUEST_ID, "confirmed")])
+
+    async def test_confirmed_start_stays_counted_when_execution_later_errors(self):
+        client = FakeClient()
+        client.wait_outcome = AppServerRpcError(-32000, "turn failed")
+        observer = RecordingInvocationObserver()
+        result = await CodexPersistentAdapter(client, FakeResolver()).execute(
+            request(), observer=observer
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["contextCommit"], "committed")
+        self.assertEqual(observer.signals, [(REQUEST_ID, "confirmed")])
 
     async def test_malformed_canonical_event_is_rejected(self):
         raw = request()
@@ -260,12 +314,14 @@ class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         client.turn_snapshots = [[]]
         adapter = CodexPersistentAdapter(client, FakeResolver())
-        result = await adapter.execute(request(timeout_ms=10))
+        observer = RecordingInvocationObserver()
+        result = await adapter.execute(request(timeout_ms=10), observer=observer)
 
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["contextCommit"], "unknown")
         self.assertEqual(result["error"]["code"], "transport_error")
         self.assertEqual(len(client.start_calls), 1)
+        self.assertEqual(observer.signals, [(REQUEST_ID, "ambiguous")])
 
         blocked = await adapter.execute(request(request_id="next-request"))
         self.assertEqual(blocked["error"]["code"], "adapter_unavailable")
@@ -277,12 +333,16 @@ class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
         client = FakeClient()
         client.start_outcome = asyncio.TimeoutError()
         client.turn_snapshots = [[turn(text="accepted before timeout")]]
-        result = await CodexPersistentAdapter(client, FakeResolver()).execute(request())
+        observer = RecordingInvocationObserver()
+        result = await CodexPersistentAdapter(client, FakeResolver()).execute(
+            request(), observer=observer
+        )
 
         self.assertEqual(result["status"], "continue")
         self.assertEqual(result["contextCommit"], "committed")
         self.assertEqual(result["text"], "accepted before timeout")
         self.assertEqual(len(client.start_calls), 1)
+        self.assertEqual(observer.signals, [(REQUEST_ID, "ambiguous")])
 
     async def test_final_recovery_after_reconnect(self):
         client = FakeClient()

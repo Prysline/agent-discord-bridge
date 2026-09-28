@@ -112,6 +112,7 @@ class DiscussionState:
     context_revision: int = 0
     invalidation_version: int = 0
     in_flight: DispatchToken | None = None
+    invocation_started: bool = False
     pending_result: PendingResult | None = None
     last_speaker: str | None = None
     suspension_reason: str = ""
@@ -158,10 +159,11 @@ class ConversationPolicy:
             state.context_revision += 1
             return Transition(False, "context-observed", "peer output cannot schedule AI")
 
-        if content == self.stop_command or content.startswith(self.stop_command + " "):
+        control = self.classify_control(content)
+        if control == "stop":
             return self._stop(state)
 
-        if content == self.start_command or content.startswith(self.start_command + " "):
+        if control == "start":
             if state.phase in {"active", "closing-check"}:
                 return Transition(False, "rejected", "discussion active; use !stop first")
             return self._start(state, event.channel_id, content)
@@ -177,6 +179,15 @@ class ConversationPolicy:
         if state.phase == "active":
             return Transition(True, "context-intervention", "discussion remains active")
         return Transition(True, "human-context", "no active discussion")
+
+    def classify_control(self, content: str) -> Literal["start", "stop"] | None:
+        """Classify only the command boundary; validation remains in handle_event."""
+        value = content.strip()
+        if value == self.stop_command or value.startswith(self.stop_command + " "):
+            return "stop"
+        if value == self.start_command or value.startswith(self.start_command + " "):
+            return "start"
+        return None
 
     def next_dispatch(self, channel_id: str) -> Transition:
         state = self._state(channel_id)
@@ -212,8 +223,6 @@ class ConversationPolicy:
 
         state = self._state(channel_id)
         agent_id = ready.agent_id
-        quota = state.quotas[agent_id]
-        quota.used_calls += 1
         assert state.safety is not None
         state.safety.dispatched_calls += 1
 
@@ -226,11 +235,28 @@ class ConversationPolicy:
             invalidation_version=state.invalidation_version,
         )
         state.in_flight = token
+        state.invocation_started = False
         if state.phase == "active":
             state.next_index = (state.participants.index(agent_id) + 1) % len(
                 state.participants
             )
         return Transition(True, "dispatch-started", agent_id=agent_id, token=token)
+
+    def record_invocation_started(
+        self, channel_id: str, token: DispatchToken
+    ) -> Transition:
+        """Charge one model call at the adapter's invocation-start boundary."""
+        state = self._state(channel_id)
+        invalid = self._validate_current_token(state, token)
+        if invalid is not None:
+            return invalid
+        if state.invocation_started:
+            return Transition(
+                True, "invocation-already-recorded", agent_id=token.agent_id, token=token
+            )
+        state.quotas[token.agent_id].used_calls += 1
+        state.invocation_started = True
+        return Transition(True, "invocation-recorded", agent_id=token.agent_id, token=token)
 
     def record_result(
         self,
@@ -250,6 +276,7 @@ class ConversationPolicy:
         result = PendingResult(token, status, text)
         if status == "abstain":
             state.in_flight = None
+            state.invocation_started = False
             state.last_speaker = token.agent_id
             return self._apply_result_semantics(state, result)
         state.pending_result = result
@@ -277,6 +304,7 @@ class ConversationPolicy:
             raise ValueError(f"invalid delivery status: {delivery}")
 
         state.in_flight = None
+        state.invocation_started = False
         state.pending_result = None
         if pending.text:
             state.quotas[token.agent_id].used_chars += len(pending.text)
@@ -299,6 +327,16 @@ class ConversationPolicy:
         }:
             raise ValueError(f"invalid failure reason: {reason}")
         return self._suspend(state, reason.replace("_", " "))
+
+    def record_reconciled_delivery(
+        self, channel_id: str, token: DispatchToken, *, text: str
+    ) -> Transition:
+        """Account a pre-invalidation send later proven delivered, without revival."""
+        state = self._state(channel_id)
+        if state.discussion_id != token.discussion_id or token.agent_id not in state.quotas:
+            return Transition(False, "ignored", "delivery does not belong to discussion")
+        state.quotas[token.agent_id].used_chars += len(text)
+        return Transition(False, "delivery-reconciled", agent_id=token.agent_id, token=token)
 
     def _apply_result_semantics(
         self, state: DiscussionState, pending: PendingResult
@@ -375,6 +413,7 @@ class ConversationPolicy:
         state.context_revision += 1
         state.invalidation_version += 1
         state.in_flight = None
+        state.invocation_started = False
         state.pending_result = None
         state.last_speaker = None
         state.suspension_reason = ""
@@ -407,6 +446,7 @@ class ConversationPolicy:
         state.closing_remaining.clear()
         state.invalidation_version += 1
         state.in_flight = None
+        state.invocation_started = False
         state.pending_result = None
         return Transition(True, "stopped", "discussion invalidated")
 
@@ -415,6 +455,7 @@ class ConversationPolicy:
         state.suspension_reason = reason
         state.invalidation_version += 1
         state.in_flight = None
+        state.invocation_started = False
         state.pending_result = None
         return Transition(False, "suspended", reason)
 

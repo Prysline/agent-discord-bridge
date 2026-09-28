@@ -8,7 +8,7 @@
 
 - Codex：已遷入既有、通過測試的 Discord bridge 與 persistent adapter core。
 - Antigravity：尚未遷入；既有 fork 仍是唯讀遷移來源。
-- 共用 conversation policy：已依 frozen contract 建立 deterministic discussion state machine 與 contract tests，但尚未接上 Codex production 入口；Antigravity adapter 也尚未遷入。
+- 共用 shared core：已依 frozen contract 建立 canonical event log、persistent event-delta cursor、human-turn／bounded-discussion orchestration、AgentResult validation 與 delivery/contextCommit fence；尚未接上 Codex production 入口，Antigravity adapter 也尚未遷入。
 - Claude Code：未 bundled、未驗證；未來可依公開 adapter contract 由有環境者提交 PR。
 
 目前根目錄程式仍代表 Codex migration baseline。它可以用來驗證既有行為，但目錄結構不是最終公開 API。
@@ -28,11 +28,13 @@
 - `bot.py`：Discord 與 Codex app-server 橋接程式。
 - `conversation_policy.py`：目前 Codex 版的 allowlist、提及／回覆與 peer turn limiter。
 - `codex_adapter/`：persistent shared-lane adapter core。
-- `agent_bridge/conversation_policy.py`：尚未接線的 core-owned bounded-discussion scheduler、closing check、quota accounting 與 restart／stop state machine。
+- `agent_bridge/contracts.py`：跨 adapter 的 AgentRequest／AgentResult v1 validation。
+- `agent_bridge/conversation_policy.py`：core-owned bounded-discussion scheduler、closing check、quota accounting 與 restart／stop state machine。
+- `agent_bridge/orchestrator.py`：memory-only canonical log、human-turn、discussion、cursor、delivery 與 contextCommit coordination。
 - `tests/`：routing policy 與 Codex adapter tests。
 - `shared_workspace/`：預設隔離工作目錄說明。
 
-Shared state machine 已實作 `continue`／`complete`／`abstain` 的 discussion lifecycle；但 Codex persistent adapter 目前對可靠非空 final 仍只回傳 `continue`，且 production Discord 入口尚未接上 shared policy。因此目前不能宣稱端到端 `bounded-discussion` 已可使用。
+Shared orchestration core 已能以 fake adapter 驗證 `continue`／`complete`／`abstain` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；但 Codex adapter 對真實模型 final 仍只回傳 `continue`，root `bot.py` 也仍走 legacy direct path。現有 `ThreadMapStore` 會自動建立 thread，無法提供 frozen contract 要求的 existing `bindingId + generation` gate，因此 production entry 尚未切換，不能宣稱 Discord E2E、durable restart 或端到端 `bounded-discussion` 已可使用。
 
 ## 本機設定
 
