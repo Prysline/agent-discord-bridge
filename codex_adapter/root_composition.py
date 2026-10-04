@@ -19,13 +19,14 @@ from .persistent import AppServerClient, CodexPersistentAdapter
 class RootDiscussionSettings:
     participants: tuple[Participant, ...]
     display_names: Mapping[str, str]
+    adapter_types: Mapping[str, str]
     global_max_dispatches: int
 
 
 def parse_root_discussion_settings(config: Mapping[str, Any]) -> RootDiscussionSettings:
     raw = config.get("sharedDiscussion")
     if raw is None:
-        return RootDiscussionSettings((), {}, 1)
+        return RootDiscussionSettings((), {}, {}, 1)
     if not isinstance(raw, Mapping):
         raise ValueError("sharedDiscussion must be an object")
     maximum = raw.get("globalMaxDispatches")
@@ -36,6 +37,7 @@ def parse_root_discussion_settings(config: Mapping[str, Any]) -> RootDiscussionS
         raise ValueError("sharedDiscussion.participants must be an array")
     participants: list[Participant] = []
     display_names: dict[str, str] = {}
+    adapter_types: dict[str, str] = {}
     for index, entry in enumerate(entries):
         if not isinstance(entry, Mapping):
             raise ValueError(f"sharedDiscussion.participants[{index}] must be an object")
@@ -59,7 +61,11 @@ def parse_root_discussion_settings(config: Mapping[str, Any]) -> RootDiscussionS
             )
         )
         display_names[agent_id] = display_name
-    return RootDiscussionSettings(tuple(participants), display_names, maximum)
+        adapter_type = entry.get("adapter")
+        if adapter_type not in {"codex", "antigravity"}:
+            raise ValueError(f"participants[{index}].adapter is invalid")
+        adapter_types[agent_id] = adapter_type
+    return RootDiscussionSettings(tuple(participants), display_names, adapter_types, maximum)
 
 
 def _non_empty(value: Any, field: str) -> str:

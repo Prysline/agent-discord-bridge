@@ -21,15 +21,14 @@ import websockets
 from dotenv import load_dotenv
 
 from agent_bridge.discord_delivery import DiscordRoomDelivery
+from agent_bridge.heterogeneous_composition import compose_existing_heterogeneous_root
 from agent_bridge.root_shared import safe_failure_message
+from antigravity_adapter.transport import SidecarHttpClient
 from codex_adapter.app_server import (
     CodexAppServerClient as SharedCodexAppServerClient,
     StdioTransport as SharedStdioTransport,
 )
-from codex_adapter.root_composition import (
-    compose_existing_codex_root,
-    parse_root_discussion_settings,
-)
+from codex_adapter.root_composition import parse_root_discussion_settings
 
 from conversation_policy import (
     AccessDecision,
@@ -65,6 +64,14 @@ SHARED_BINDINGS_PATH = (
     SHARED_BINDINGS_PATH_RAW
     if SHARED_BINDINGS_PATH_RAW.is_absolute()
     else BOT_DIR / SHARED_BINDINGS_PATH_RAW
+).resolve()
+ANTIGRAVITY_RENDEZVOUS_PATH_RAW = Path(
+    os.getenv("ANTIGRAVITY_RENDEZVOUS_PATH", "antigravity-sidecar.runtime.json")
+)
+ANTIGRAVITY_RENDEZVOUS_PATH = (
+    ANTIGRAVITY_RENDEZVOUS_PATH_RAW
+    if ANTIGRAVITY_RENDEZVOUS_PATH_RAW.is_absolute()
+    else BOT_DIR / ANTIGRAVITY_RENDEZVOUS_PATH_RAW
 ).resolve()
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "AI Companion").strip() or "AI Companion"
 PERSONA_PATH_RAW = Path(os.getenv("BOT_PERSONA_PATH", "persona.md"))
@@ -899,14 +906,15 @@ if SHARED_CORE_ENABLED:
         lambda: SharedStdioTransport(shared_command, CODEX_CWD)
     )
     shared_discussion = parse_root_discussion_settings(CONFIG)
-    shared_root = compose_existing_codex_root(
+    shared_root = compose_existing_heterogeneous_root(
         binding_path=SHARED_BINDINGS_PATH,
-        agent_id=SHARED_AGENT_ID,
-        client=shared_app_client,
+        primary_agent_id=SHARED_AGENT_ID,
+        adapter_types=shared_discussion.adapter_types,
+        codex_client=shared_app_client,
+        antigravity_transport=SidecarHttpClient(ANTIGRAVITY_RENDEZVOUS_PATH),
         delivery=shared_delivery,
-        display_name=BOT_DISPLAY_NAME,
         participants=list(shared_discussion.participants),
-        participant_display_names=dict(shared_discussion.display_names),
+        display_names=dict(shared_discussion.display_names),
         global_max_dispatches=shared_discussion.global_max_dispatches,
         timeout_ms=(CODEX_TURN_TIMEOUT_SEC * 1000 if CODEX_TURN_TIMEOUT_SEC else 120_000),
     )

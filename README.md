@@ -7,8 +7,8 @@
 ## 目前狀態
 
 - Codex：已遷入既有、通過測試的 Discord bridge 與 persistent adapter core。
-- Antigravity：尚未遷入；既有 fork 仍是唯讀遷移來源。
-- 共用 shared core：已依 frozen contract 建立 canonical event log、persistent event-delta cursor、human-turn／bounded-discussion orchestration、AgentResult validation 與 delivery/contextCommit fence；Codex root 已有 opt-in human-turn 與 bounded-discussion wiring，Antigravity adapter 尚未遷入。
+- Antigravity：persistent adapter、exact existing-conversation resolver、authenticated Sidecar client 與 heterogeneous composition 已在本機實作並以 fake transport 測試；尚未完成 cross-adapter 真人 Discord E2E。
+- 共用 shared core：已依 frozen contract 建立 canonical event log、persistent event-delta cursor、human-turn／bounded-discussion orchestration、AgentResult validation 與 delivery/contextCommit fence；root composition 可依 participant 設定選用 Codex 或 Antigravity adapter。
 - Claude Code：未 bundled、未驗證；未來可依公開 adapter contract 由有環境者提交 PR。
 
 目前根目錄程式仍代表 Codex migration baseline。它可以用來驗證既有行為，但目錄結構不是最終公開 API。
@@ -28,6 +28,7 @@
 - `bot.py`：Discord 與 Codex app-server 橋接程式。
 - `conversation_policy.py`：目前 Codex 版的 allowlist、提及／回覆與 peer turn limiter。
 - `codex_adapter/`：persistent shared-lane adapter core。
+- `antigravity_adapter/`：existing-conversation resolver、Sidecar transport 與 persistent shared-lane adapter。
 - `agent_bridge/contracts.py`：跨 adapter 的 AgentRequest／AgentResult v1 validation。
 - `agent_bridge/conversation_policy.py`：core-owned bounded-discussion scheduler、closing check、quota accounting 與 restart／stop state machine。
 - `agent_bridge/binding_control.py` 與 `agent_bridge/binding_bootstrap.py`：memory-only logical binding state 與本機 existing-binding bootstrap parser。
@@ -51,9 +52,11 @@ Copy-Item bindings.example.json bindings.local.json
 python -m pip install -r requirements.txt
 ```
 
-`bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID 只存在 adapter-local resolver。設定矛盾會在 bootstrap 時拒絕載入，不會建立或替換 thread。真實 Token、numeric ID、native thread ID 與 persona 不得提交。
+`bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID／Antigravity conversation ID 只存在各自 adapter-local resolver。設定矛盾會 fail closed，不會建立或替換 native session。真實 Token、numeric ID、native session ID 與 persona 不得提交。
 
-設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 會使用 bootstrap existing binding、shared canonical event-delta 與 `CodexPersistentAdapter`；此模式不讀 Discord recent history、不建立 thread，也不在失敗時 fallback legacy execution。`config.json` 的 `sharedDiscussion` 明確列出可參與 `!discuss` 的 Discord mention、logical `agentId`、個別字元／呼叫額度與 unattended dispatch hard limit；每位 participant 都必須在 `bindings.local.json` 有 existing binding。`!stop` 會進 shared stop lifecycle，root 不另寫 cancellation semantics。目前仍只支援單則 Discord delivery，peer ingestion、chunking 與 durable persistence 尚未接線。
+Antigravity Sidecar 的追蹤範例位於 `antigravity_adapter/sidecar/sidecar.example.json`；安裝時須把 rendezvous placeholder 換成本機 gitignored 路徑，並讓 Stop hook 以同一路徑呼叫 `capture-stop.ps1`。worker 只監聽 `127.0.0.1`，每次啟動輪替 bearer token 與 instance identity，並從 Antigravity 注入的 PATH discovery `agentapi`；不支援的 wrapper 會拒絕啟動，不會退回 CDP 或猜測安裝路徑。
+
+設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 使用 bootstrap existing binding 與 shared canonical event-delta；此模式不讀 Discord recent history、不建立 native session，也不在失敗時 fallback legacy execution。`config.json` 的 participant 以 `adapter: codex|antigravity` 選擇 composition；Antigravity 另需把 `ANTIGRAVITY_RENDEZVOUS_PATH` 指向 Sidecar 每次啟動 atomic 發布的 gitignored runtime file。`!stop` 仍只走 shared invalidation；Antigravity 目前準確宣告 `canCancelInFlight=false`，late result 不能越過 core token。cross-adapter 真人 E2E、chunking 與 durable persistence尚未完成。
 
 ## 驗證
 
@@ -63,7 +66,7 @@ python -m unittest discover -s tests -v
 git diff --check
 ```
 
-自動測試不會登入 Discord，也不會使用真實 Token。Human-turn root path 已完成一次真人 Manual E2E；bounded discussion 與 `!stop` 仍需使用真實 participant bindings 另做 Manual E2E，不能由本機測試推定完成。
+自動測試不會登入 Discord，也不會使用真實 Token。Codex human-turn root path 已完成一次真人 Manual E2E；bounded discussion、Antigravity 與 cross-adapter `!stop` 仍需使用真實 participant bindings 另做 Manual E2E，不能由本機測試推定完成。
 
 ## 授權與來源
 

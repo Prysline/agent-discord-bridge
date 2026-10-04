@@ -20,11 +20,13 @@
       "bindingId": "BINDING_A",
       "generation": 7,
       "threadId": "EXISTING_CODEX_THREAD_A"
-    },
+    }
+  ],
+  "antigravityBindings": [
     {
       "bindingId": "BINDING_B",
       "generation": 3,
-      "threadId": "EXISTING_CODEX_THREAD_B"
+      "conversationId": "EXISTING_ANTIGRAVITY_CONVERSATION_B"
     }
   ]
 }

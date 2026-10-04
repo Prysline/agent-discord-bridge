@@ -286,8 +286,8 @@ class RootCompositionTests(unittest.TestCase):
 
     def test_discussion_config_and_composition_include_all_existing_participants(self):
         config = {"sharedDiscussion": {"globalMaxDispatches": 6, "participants": [
-            {"agentId": "agent-a", "mentionId": "101", "displayName": "A", "budgetChars": 1000, "maxCalls": 2},
-            {"agentId": "agent-b", "mentionId": "202", "displayName": "B", "budgetChars": 1200, "maxCalls": 3},
+            {"agentId": "agent-a", "adapter": "codex", "mentionId": "101", "displayName": "A", "budgetChars": 1000, "maxCalls": 2},
+            {"agentId": "agent-b", "adapter": "codex", "mentionId": "202", "displayName": "B", "budgetChars": 1200, "maxCalls": 3},
         ]}}
         settings = parse_root_discussion_settings(config)
         raw = {"logicalBindings": [
@@ -306,8 +306,8 @@ class RootCompositionTests(unittest.TestCase):
 
     def test_invalid_native_thread_fails_closed_without_turn_creation(self):
         settings = parse_root_discussion_settings({"sharedDiscussion": {"globalMaxDispatches": 2, "participants": [
-            {"agentId": "agent-a", "mentionId": "101", "budgetChars": 1000, "maxCalls": 2},
-            {"agentId": "agent-b", "mentionId": "202", "budgetChars": 1000, "maxCalls": 2},
+            {"agentId": "agent-a", "adapter": "codex", "mentionId": "101", "budgetChars": 1000, "maxCalls": 2},
+            {"agentId": "agent-b", "adapter": "codex", "mentionId": "202", "budgetChars": 1000, "maxCalls": 2},
         ]}})
         raw = {"logicalBindings": [
             {"roomId": "room-1", "agentId": "agent-a", "bindingId": "binding-a", "generations": [1], "activeGeneration": 1},

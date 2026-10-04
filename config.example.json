@@ -10,6 +10,7 @@
     "participants": [
       {
         "agentId": "AGENT_A",
+        "adapter": "codex",
         "mentionId": "AGENT_A_DISCORD_BOT_ID",
         "displayName": "Agent A",
         "budgetChars": 2000,
@@ -17,6 +18,7 @@
       },
       {
         "agentId": "AGENT_B",
+        "adapter": "antigravity",
         "mentionId": "AGENT_B_DISCORD_BOT_ID",
         "displayName": "Agent B",
         "budgetChars": 2000,

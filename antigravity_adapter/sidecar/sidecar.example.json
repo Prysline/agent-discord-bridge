@@ -1,0 +1,15 @@
+{
+  "display_name": "Agent Discord Bridge Sidecar",
+  "description": "Authenticated loopback transport for an existing Antigravity conversation",
+  "command": "python",
+  "args": [
+    "-B",
+    "-m",
+    "antigravity_adapter.sidecar.worker",
+    "--port",
+    "8765",
+    "--rendezvous",
+    "LOCAL_GITIGNORED_RENDEZVOUS_PATH"
+  ],
+  "restart_policy": "never"
+}

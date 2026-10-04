@@ -55,8 +55,16 @@ Discord ingress
 2. 為 shared conversation policy 補上 frozen contract state machine 與回歸測試。（已完成）
 3. 建立 canonical log、event-delta cursor、shared contracts 與 orchestrator wiring target。（已完成 memory-only core）
 4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，將 Codex Discord human-turn 與 bounded-discussion root 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。（本機 wiring 已完成；bounded discussion Manual E2E pending）
-5. 對 Antigravity 未提交工作樹做獨立測試與敏感資料檢查，再遷入 adapter。
-6. 兩個 adapter 均通過共用 contract tests 後，才處理舊 fork 的退場或薄化。
+5. 以既有 probe evidence 建立 Antigravity exact binding、authenticated Sidecar transport 與 persistent adapter，並在 composition layer 依 participant 選擇 runtime。（已完成本機實作與 automated fake-transport integration；真人 cross-adapter E2E pending）
+6. 兩個 adapter 均通過共用 contract tests 後，才處理舊 fork 的退場或薄化。（contract regression 已接入 full suite；舊 fork 尚未退場）
+
+## Antigravity adapter
+
+`antigravity_adapter/` 不讀 Discord，也不持有 discussion state。Resolver 只接受 exact `bindingId + generation`，把 native `conversationId` 留在 adapter-local mapping；既有 inactive generation 只要仍有明確 mapping 便可服務 discussion snapshot。Transport 每次呼叫都重新讀取 gitignored rendezvous，且只接受 `127.0.0.1`，以 ephemeral bearer token 與 instance identity 存取 Sidecar。
+
+Sidecar `/send` 接受後才回報 confirmed invocation；送出結果不明則保守回報 ambiguous invocation 並以可得 request identity read back。唯一 positive result 才把 context 判為 committed；無法相關時維持 unknown，不 replay。正式模型輸出目前一律映射為 `continue`，不自行發明 `complete`／`abstain` parser。平台沒有已證明的強 cancellation，因此 capability 是 `canCancelInFlight=false`；core invalidation 仍保證 late output 不會被送往 Discord或推進 discussion。
+
+目前 cross-adapter automated coverage 使用 fake Sidecar transport；尚未驗證真實 Antigravity Sidecar、真實 Codex binding 與 Discord 同場往返，因此不得稱為 production-ready 或 cross-adapter E2E verified。
 
 ## 不在初始快照中的功能
 
