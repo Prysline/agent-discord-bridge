@@ -9,7 +9,9 @@
     "--port",
     "8765",
     "--rendezvous",
-    "LOCAL_GITIGNORED_RENDEZVOUS_PATH"
+    "LOCAL_GITIGNORED_RENDEZVOUS_PATH",
+    "--transcript-root",
+    "LOCAL_ANTIGRAVITY_TRANSCRIPT_ROOT"
   ],
   "restart_policy": "never"
 }

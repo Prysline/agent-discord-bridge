@@ -25,7 +25,9 @@ from typing import Any
 
 
 MAX_BODY = 1024 * 1024
+MAX_DELTA = 16 * 1024 * 1024
 WRAPPER = re.compile(r'^\s*"(?P<target>[^"]+\.exe)"(?P<fixed>.*?)\s+%\*\s*$', re.I)
+CONVERSATION_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 
 
 class SidecarFailure(RuntimeError):
@@ -66,7 +68,8 @@ class Pending:
     request_id: str
     conversation_id: str
     marker: str
-    transcript_path: str | None
+    transcript_path: Path
+    file_identity: tuple[int, int] | None
     offset: int
     deadline: float
     status: str = "pending"
@@ -75,36 +78,55 @@ class Pending:
 
 
 class State:
-    def __init__(self, timeout_seconds: int) -> None:
+    def __init__(self, timeout_seconds: int, transcript_root: str | Path) -> None:
+        try:
+            root = Path(transcript_root).resolve(strict=True)
+        except OSError as exc:
+            raise SidecarFailure("transcript_root_invalid") from exc
+        if not root.is_dir():
+            raise SidecarFailure("transcript_root_invalid")
+        self.transcript_root = root
         self.target, self.prefix, self.command_type = discover_agentapi()
         self.timeout_seconds = timeout_seconds
         self.lock = threading.Lock()
         self.requests: dict[str, Pending] = {}
         self.pending_id: str | None = None
-        self.transcripts: dict[str, str] = {}
 
     def expire(self) -> None:
         with self.lock:
             if not self.pending_id:
                 return
             value = self.requests[self.pending_id]
+            self._recover_locked(value)
             if value.status == "pending" and time.monotonic() >= value.deadline:
-                value.status = "error"
-                value.error = {"code": "timeout", "message": "Stop notification timeout"}
-                self.pending_id = None
+                self._error_locked(value, "timeout", "Result recovery timeout")
+
+    def result(self, request_id: str) -> Pending | None:
+        with self.lock:
+            value = self.requests.get(request_id)
+            if value is None:
+                return None
+            if value.status == "pending":
+                self._recover_locked(value)
+                if value.status == "pending" and time.monotonic() >= value.deadline:
+                    self._error_locked(value, "timeout", "Result recovery timeout")
+            return value
 
     def send(self, conversation_id: str, message: str, requested_id: str | None) -> Pending:
         self.expire()
+        transcript_path = self._expected_transcript(conversation_id)
+        file_identity, offset = self._baseline(transcript_path)
         with self.lock:
             if self.pending_id:
                 raise SidecarFailure("busy")
             request_id = requested_id if requested_id and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", requested_id) else uuid.uuid4().hex
             if request_id in self.requests:
                 raise SidecarFailure("duplicate_request")
-            path = self.transcripts.get(conversation_id)
-            offset = Path(path).stat().st_size if path and Path(path).is_file() else 0
             marker = f"SIDECAR_REQUEST_ID_{request_id}"
-            value = Pending(request_id, conversation_id, marker, path, offset, time.monotonic() + self.timeout_seconds)
+            value = Pending(
+                request_id, conversation_id, marker, transcript_path, file_identity,
+                offset, time.monotonic() + self.timeout_seconds,
+            )
             self.requests[request_id] = value
             self.pending_id = request_id
         completed = subprocess.run(
@@ -123,60 +145,153 @@ class State:
         return value
 
     def stop(self, payload: dict[str, Any]) -> str:
-        self.expire()
         with self.lock:
             if not self.pending_id:
                 return "unknown_stop"
             value = self.requests[self.pending_id]
-        if payload.get("conversationId") != value.conversation_id:
-            return "unknown_stop"
-        if payload.get("fullyIdle") is not True:
-            return "not_fully_idle"
-        if payload.get("error"):
-            return self._fail(value, "execution_error", "Antigravity reported an execution error")
-        transcript = payload.get("transcriptPath")
-        if not isinstance(transcript, str) or not Path(transcript).is_file():
-            return self._fail(value, "transcript_unavailable", "Stop transcript unavailable")
-        full = str(Path(transcript).resolve())
-        if value.transcript_path and os.path.normcase(full) != os.path.normcase(str(Path(value.transcript_path).resolve())):
-            return self._fail(value, "correlation_failed", "Transcript identity changed")
-        try:
-            with open(full, "rb") as stream:
-                stream.seek(value.offset)
-                delta = stream.read(16 * 1024 * 1024 + 1)
-            if len(delta) > 16 * 1024 * 1024:
-                raise ValueError
-            records = [json.loads(line) for line in delta.decode("utf-8").splitlines() if line.strip()]
-            marker_indexes = [index for index, item in enumerate(records) if value.marker in str(item.get("content", ""))]
-            if len(marker_indexes) != 1:
-                raise ValueError
-            candidates = [
-                item for item in records[marker_indexes[0] + 1 :]
-                if item.get("source") == "MODEL"
-                and item.get("type") == "PLANNER_RESPONSE"
-                and item.get("status") == "DONE"
-                and not item.get("tool_calls")
-                and isinstance(item.get("content"), str)
-                and item["content"].strip()
-            ]
-            if not candidates:
-                raise ValueError
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            return self._fail(value, "correlation_failed", "Transcript delta was ambiguous")
-        with self.lock:
-            value.status = "completed"
-            value.text = candidates[-1]["content"]
-            self.transcripts[value.conversation_id] = full
-            self.pending_id = None
-        return "completed"
+            if payload.get("conversationId") != value.conversation_id:
+                return "unknown_stop"
+            if payload.get("fullyIdle") is not True:
+                return "not_fully_idle"
+            if payload.get("error"):
+                self._error_locked(value, "execution_error", "Antigravity reported an execution error")
+                return "error"
+            if not self._hook_path_matches(value, payload.get("transcriptPath")):
+                self._error_locked(value, "transcript_unavailable", "Stop transcript unavailable")
+                return "error"
+            self._recover_locked(value)
+            if value.status == "completed":
+                return "completed"
+            if value.status == "error":
+                return "error"
+            if time.monotonic() >= value.deadline:
+                self._error_locked(value, "timeout", "Result recovery timeout")
+                return "error"
+            return "pending"
 
-    def _fail(self, value: Pending, code: str, message: str) -> str:
-        with self.lock:
-            value.status = "error"
-            value.error = {"code": code, "message": message}
-            if self.pending_id == value.request_id:
-                self.pending_id = None
-        return "error"
+    def _expected_transcript(self, conversation_id: str) -> Path:
+        if not isinstance(conversation_id, str) or not CONVERSATION_REFERENCE.fullmatch(conversation_id):
+            raise SidecarFailure("invalid_conversation_reference")
+        candidate = self.transcript_root / conversation_id / ".system_generated" / "logs" / "transcript.jsonl"
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_relative_to(self.transcript_root):
+            raise SidecarFailure("invalid_conversation_reference")
+        return candidate
+
+    def _baseline(self, path: Path) -> tuple[tuple[int, int] | None, int]:
+        if not path.exists():
+            return None, 0
+        try:
+            with path.open("rb") as stream:
+                identity = self._opened_identity(path, stream)
+                return identity, os.fstat(stream.fileno()).st_size
+        except OSError as exc:
+            raise SidecarFailure("transcript_unavailable") from exc
+
+    def _opened_identity(self, path: Path, stream: Any) -> tuple[int, int]:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(self.transcript_root):
+            raise SidecarFailure("transcript_unavailable")
+        opened = os.fstat(stream.fileno())
+        current = path.stat()
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if opened_identity != (current.st_dev, current.st_ino):
+            raise SidecarFailure("transcript_identity_changed")
+        return opened_identity
+
+    def _hook_path_matches(self, value: Pending, supplied: Any) -> bool:
+        if not isinstance(supplied, str):
+            return False
+        try:
+            resolved = Path(supplied).resolve(strict=True)
+            expected = value.transcript_path.resolve(strict=True)
+        except OSError:
+            return False
+        return resolved.is_relative_to(self.transcript_root) and resolved == expected
+
+    def _recover_locked(self, value: Pending) -> None:
+        if value.status != "pending":
+            return
+        path = value.transcript_path
+        if not path.exists():
+            if value.file_identity is not None:
+                self._error_locked(value, "transcript_identity_changed", "Transcript identity changed")
+            return
+        try:
+            with path.open("rb") as stream:
+                identity = self._opened_identity(path, stream)
+                size = os.fstat(stream.fileno()).st_size
+                if value.file_identity is None:
+                    value.file_identity = identity
+                elif identity != value.file_identity or size < value.offset:
+                    self._error_locked(value, "transcript_identity_changed", "Transcript identity changed")
+                    return
+                stream.seek(value.offset)
+                delta = stream.read(MAX_DELTA + 1)
+        except (OSError, SidecarFailure):
+            self._error_locked(value, "transcript_unavailable", "Transcript unavailable")
+            return
+        if len(delta) > MAX_DELTA:
+            self._error_locked(value, "correlation_failed", "Transcript delta was ambiguous")
+            return
+        if delta and not delta.endswith(b"\n"):
+            return
+        try:
+            text = delta.decode("utf-8")
+            records = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise ValueError
+                records.append(item)
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            self._error_locked(value, "correlation_failed", "Transcript delta was ambiguous")
+            return
+        marker_token = f"[{value.marker}]"
+        marker_occurrences = sum(
+            item.get("content", "").count(marker_token)
+            for item in records if isinstance(item.get("content"), str)
+        )
+        if marker_occurrences == 0:
+            return
+        if marker_occurrences != 1:
+            self._error_locked(value, "correlation_failed", "Transcript delta was ambiguous")
+            return
+        marker_index = next(
+            index for index, item in enumerate(records)
+            if isinstance(item.get("content"), str) and marker_token in item["content"]
+        )
+        candidates = [
+            item for item in records[marker_index + 1 :]
+            if item.get("source") == "MODEL"
+            and item.get("type") == "PLANNER_RESPONSE"
+            and item.get("status") == "DONE"
+            and not item.get("tool_calls")
+            and isinstance(item.get("content"), str)
+            and item["content"].strip()
+        ]
+        if not candidates:
+            return
+        if len(candidates) != 1:
+            self._error_locked(value, "correlation_failed", "Transcript delta was ambiguous")
+            return
+        self._complete_locked(value, candidates[0]["content"])
+
+    def _complete_locked(self, value: Pending, text: str) -> None:
+        if value.status != "pending" or self.pending_id != value.request_id:
+            return
+        value.status = "completed"
+        value.text = text
+        self.pending_id = None
+
+    def _error_locked(self, value: Pending, code: str, message: str) -> None:
+        if value.status != "pending" or self.pending_id != value.request_id:
+            return
+        value.status = "error"
+        value.error = {"code": code, "message": message}
+        self.pending_id = None
 
 
 class Server(ThreadingHTTPServer):
@@ -221,14 +336,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not self._authorized(): return
-        self.server.state.expire()
         if self.path == "/health":
+            self.server.state.expire()
             self._json(200, {"status":"ready", "agentapi":True, "commandType":self.server.state.command_type, "pending":bool(self.server.state.pending_id)})
             return
         match = re.fullmatch(r"/result/([A-Za-z0-9_-]{1,128})", self.path)
-        if not match or match.group(1) not in self.server.state.requests:
+        value = self.server.state.result(match.group(1)) if match else None
+        if value is None:
             self._json(404, {"error":"request_not_found"}); return
-        value = self.server.state.requests[match.group(1)]
         body: dict[str, Any] = {"requestId": value.request_id, "status": value.status}
         if value.status == "completed": body["text"] = value.text
         if value.status == "error": body["error"] = value.error
@@ -270,10 +385,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--rendezvous", type=Path, required=True)
+    parser.add_argument("--transcript-root", type=Path, required=True)
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535 or args.timeout_seconds < 1: raise SystemExit("invalid Sidecar settings")
     server = Server(("127.0.0.1", args.port), Handler)
-    server.state = State(args.timeout_seconds)
+    server.state = State(args.timeout_seconds, args.transcript_root)
     server.token = secrets.token_hex(32)
     server.instance_id = uuid.uuid4().hex
     publish(args.rendezvous, args.port, server.token, server.instance_id)

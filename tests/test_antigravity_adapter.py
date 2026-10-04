@@ -174,6 +174,33 @@ class AntigravityAdapterTests(unittest.TestCase):
         self.assertEqual(outcome["state"], "invalidated")
         self.assertFalse(adapter.capabilities["canCancelInFlight"])
 
+    def test_late_recovered_final_cannot_cross_core_invalidation(self):
+        class BlockingTransport(FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.polling = asyncio.Event()
+                self.release = asyncio.Event()
+            async def result(self, request_id):
+                self.polling.set()
+                await self.release.wait()
+                return {"status":"completed", "text":"late reply"}
+
+        async def scenario():
+            transport = BlockingTransport()
+            adapter = AntigravityPersistentAdapter(
+                transport, bootstrap_existing_bindings(bindings()).binding_resolver
+            )
+            task = asyncio.create_task(adapter.execute(request(), observer=Observer()))
+            await transport.polling.wait()
+            await adapter.cancel("request-1")
+            transport.release.set()
+            return await task
+
+        result = asyncio.run(scenario())
+        self.assertEqual(result["contextCommit"], "committed")
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("text", result)
+
     def test_shared_orchestrator_commits_antigravity_output_after_delivery(self):
         adapter = AntigravityPersistentAdapter(FakeTransport(), bootstrap_existing_bindings(bindings()).binding_resolver)
         delivery = Delivery()
@@ -338,19 +365,40 @@ class SidecarHttpClientTests(unittest.TestCase):
 
 class SidecarCorrelationTests(unittest.TestCase):
     def make_state(self, directory):
+        root = Path(directory) / "brain"
+        root.mkdir(exist_ok=True)
         with patch("antigravity_adapter.sidecar.worker.discover_agentapi", return_value=("agentapi.exe", [], "direct-executable")):
-            value = worker.State(1)
-        value.transcripts["conversation"] = str(Path(directory) / "transcript.jsonl")
-        return value
+            return worker.State(1, root)
+
+    def transcript(self, state, conversation="conversation"):
+        path = state.transcript_root / conversation / ".system_generated" / "logs" / "transcript.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def dispatch(self, state, transcript=None, request_id="request-1"):
+        if transcript is not None and not transcript.exists():
+            transcript.write_text("", encoding="utf-8")
+        with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
+            run.return_value.returncode = 0
+            return state.send("conversation", "hello", request_id)
+
+    def write_records(self, transcript, records):
+        transcript.write_text(
+            "\n".join(json.dumps(item) for item in records) + "\n",
+            encoding="utf-8",
+        )
+
+    def final_records(self, pending, text="final"):
+        return [
+            {"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":f"[{pending.marker}]\nhello"},
+            {"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":text},
+        ]
 
     def test_terminal_tool_call_extracts_only_final_text(self):
         with tempfile.TemporaryDirectory() as directory:
-            transcript = Path(directory) / "transcript.jsonl"
-            transcript.write_text("", encoding="utf-8")
             state = self.make_state(directory)
-            with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
-                run.return_value.returncode = 0
-                pending = state.send("conversation", "hello", "request-1")
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
             records = [
                 {"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":f"[{pending.marker}]\nhello"},
                 {"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"tool", "tool_calls":[{"name":"terminal"}]},
@@ -361,10 +409,180 @@ class SidecarCorrelationTests(unittest.TestCase):
         self.assertEqual(outcome, "completed")
         self.assertEqual(pending.text, "final")
 
-    def test_ambiguous_transcript_fails_closed_and_busy_is_rejected(self):
+    def test_hookless_result_polling_recovers_unique_final(self):
         with tempfile.TemporaryDirectory() as directory:
-            transcript = Path(directory) / "transcript.jsonl"; transcript.write_text("", encoding="utf-8")
             state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(pending, "hookless reply"))
+            recovered = state.result(pending.request_id)
+        self.assertEqual(recovered.status, "completed")
+        self.assertEqual(recovered.text, "hookless reply")
+        self.assertIsNone(state.pending_id)
+
+    def test_delayed_final_remains_pending_then_completes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(pending)[:1])
+            self.assertEqual(state.result(pending.request_id).status, "pending")
+            self.write_records(transcript, self.final_records(pending))
+            self.assertEqual(state.result(pending.request_id).status, "completed")
+
+    def test_dispatch_offset_excludes_old_conversation_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            self.write_records(transcript, [
+                {"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[SIDECAR_REQUEST_ID_old]"},
+                {"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"old reply"},
+            ])
+            pending = self.dispatch(state, transcript)
+            self.assertEqual(state.result(pending.request_id).status, "pending")
+            with transcript.open("a", encoding="utf-8") as stream:
+                for item in self.final_records(pending, "new reply"):
+                    stream.write(json.dumps(item) + "\n")
+            recovered = state.result(pending.request_id)
+            self.assertEqual(recovered.status, "completed")
+            self.assertEqual(recovered.text, "new reply")
+
+    def test_transcript_created_after_dispatch_is_accepted_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state)
+            self.assertFalse(transcript.exists())
+            self.write_records(transcript, self.final_records(pending))
+            self.assertEqual(state.result(pending.request_id).status, "completed")
+
+    def test_duplicate_marker_and_multiple_finals_fail_closed(self):
+        cases = (
+            lambda pending: self.final_records(pending) + self.final_records(pending)[:1],
+            lambda pending: self.final_records(pending) + [{"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"second"}],
+        )
+        for records in cases:
+            with self.subTest(case=records), tempfile.TemporaryDirectory() as directory:
+                state = self.make_state(directory)
+                transcript = self.transcript(state)
+                pending = self.dispatch(state, transcript)
+                self.write_records(transcript, records(pending))
+                recovered = state.result(pending.request_id)
+                self.assertEqual(recovered.status, "error")
+                self.assertEqual(recovered.error["code"], "correlation_failed")
+
+    def test_incomplete_tail_waits_but_complete_malformed_line_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            raw = "\n".join(json.dumps(item) for item in self.final_records(pending))
+            transcript.write_text(raw[:-2], encoding="utf-8")
+            self.assertEqual(state.result(pending.request_id).status, "pending")
+            transcript.write_text(raw + "\n", encoding="utf-8")
+            self.assertEqual(state.result(pending.request_id).status, "completed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            transcript.write_text("{not-json}\n", encoding="utf-8")
+            recovered = state.result(pending.request_id)
+            self.assertEqual(recovered.status, "error")
+            self.assertEqual(recovered.error["code"], "correlation_failed")
+
+    def test_truncation_replacement_and_disappearance_fail_closed(self):
+        for mode in ("truncate", "replace", "disappear"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                state = self.make_state(directory)
+                transcript = self.transcript(state)
+                transcript.write_text("baseline\n", encoding="utf-8")
+                pending = self.dispatch(state, transcript)
+                if mode == "replace":
+                    replacement = transcript.with_suffix(".replacement")
+                    replacement.write_text("", encoding="utf-8")
+                    replacement.replace(transcript)
+                elif mode == "truncate":
+                    transcript.write_text("", encoding="utf-8")
+                else:
+                    transcript.unlink()
+                recovered = state.result(pending.request_id)
+                self.assertEqual(recovered.status, "error")
+                self.assertEqual(recovered.error["code"], "transcript_identity_changed")
+
+    def test_invalid_conversation_references_and_root_mismatch_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            for value in ("../escape", "nested/path", "nested\\path", "", "C:\\absolute"):
+                with self.subTest(value=value), self.assertRaisesRegex(worker.SidecarFailure, "invalid_conversation_reference"):
+                    state.send(value, "hello", None)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            outside = Path(directory) / "outside.jsonl"
+            outside.write_text("", encoding="utf-8")
+            outcome = state.stop({"conversationId":"conversation","fullyIdle":True,"transcriptPath":str(outside)})
+            self.assertEqual(outcome, "error")
+            self.assertEqual(pending.error["code"], "transcript_unavailable")
+
+    def test_transcript_root_and_symlink_escape_are_rejected_without_path_disclosure(self):
+        with patch("antigravity_adapter.sidecar.worker.discover_agentapi", return_value=("agentapi.exe", [], "direct-executable")):
+            with self.assertRaisesRegex(worker.SidecarFailure, "transcript_root_invalid") as missing:
+                worker.State(1, "private-root-that-does-not-exist")
+        self.assertNotIn("private-root", str(missing.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            with patch.object(type(state.transcript_root), "resolve", return_value=outside.resolve()):
+                with self.assertRaisesRegex(worker.SidecarFailure, "invalid_conversation_reference"):
+                    state._expected_transcript("conversation")
+
+    def test_deadline_performs_one_final_refresh_before_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(pending, "at deadline"))
+            pending.deadline = time.monotonic() - 1
+            state.expire()
+            self.assertEqual(pending.status, "completed")
+            self.assertEqual(pending.text, "at deadline")
+
+    def test_terminal_request_releases_global_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            first = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(first))
+            self.assertEqual(state.result(first.request_id).status, "completed")
+            second = self.dispatch(state, transcript, "request-2")
+            self.assertEqual(second.status, "pending")
+            self.assertEqual(state.pending_id, "request-2")
+
+    def test_polling_and_stop_each_win_exactly_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(pending, "poll wins"))
+            self.assertEqual(state.result(pending.request_id).status, "completed")
+            self.assertEqual(state.stop({"conversationId":"conversation","fullyIdle":True,"transcriptPath":str(transcript)}), "unknown_stop")
+            self.assertEqual(pending.text, "poll wins")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(pending, "stop wins"))
+            self.assertEqual(state.stop({"conversationId":"conversation","fullyIdle":True,"transcriptPath":str(transcript)}), "completed")
+            self.assertEqual(state.result(pending.request_id).text, "stop wins")
+
+    def test_missing_marker_remains_pending_and_busy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            transcript.write_text("", encoding="utf-8")
             with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
                 run.return_value.returncode = 0
                 pending = state.send("conversation", "hello", "request-1")
@@ -372,16 +590,14 @@ class SidecarCorrelationTests(unittest.TestCase):
                     state.send("conversation", "again", "request-2")
             transcript.write_text(json.dumps({"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"guess"})+"\n", encoding="utf-8")
             outcome = state.stop({"conversationId":"conversation","fullyIdle":True,"error":None,"transcriptPath":str(transcript)})
-        self.assertEqual(outcome, "error")
-        self.assertEqual(pending.error["code"], "correlation_failed")
+        self.assertEqual(outcome, "pending")
+        self.assertEqual(pending.status, "pending")
 
     def test_timeout_releases_busy_slot_and_late_stop_does_not_revive_request(self):
         with tempfile.TemporaryDirectory() as directory:
-            transcript = Path(directory) / "transcript.jsonl"; transcript.write_text("", encoding="utf-8")
             state = self.make_state(directory)
-            with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
-                run.return_value.returncode = 0
-                pending = state.send("conversation", "hello", "request-1")
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
             pending.deadline = time.monotonic() - 1
             state.expire()
             transcript.write_text(
@@ -395,11 +611,9 @@ class SidecarCorrelationTests(unittest.TestCase):
 
     def test_unmatched_stop_does_not_consume_current_request(self):
         with tempfile.TemporaryDirectory() as directory:
-            transcript = Path(directory) / "transcript.jsonl"; transcript.write_text("", encoding="utf-8")
             state = self.make_state(directory)
-            with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
-                run.return_value.returncode = 0
-                pending = state.send("conversation", "hello", "request-1")
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
             outcome = state.stop({"conversationId":"different", "fullyIdle":True, "transcriptPath":str(transcript)})
         self.assertEqual(outcome, "unknown_stop")
         self.assertEqual(state.pending_id, pending.request_id)
@@ -408,11 +622,9 @@ class SidecarCorrelationTests(unittest.TestCase):
     def test_malformed_and_unreadable_transcripts_fail_closed(self):
         for malformed in (True, False):
             with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as directory:
-                transcript = Path(directory) / "transcript.jsonl"; transcript.write_text("", encoding="utf-8")
                 state = self.make_state(directory)
-                with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
-                    run.return_value.returncode = 0
-                    pending = state.send("conversation", "hello", "request-1")
+                transcript = self.transcript(state)
+                pending = self.dispatch(state, transcript)
                 if malformed:
                     transcript.write_text("{not-json}\n", encoding="utf-8")
                     path = str(transcript)
@@ -425,11 +637,9 @@ class SidecarCorrelationTests(unittest.TestCase):
 
     def test_sidecar_restart_cannot_complete_stale_request(self):
         with tempfile.TemporaryDirectory() as directory:
-            transcript = Path(directory) / "transcript.jsonl"; transcript.write_text("", encoding="utf-8")
             old_state = self.make_state(directory)
-            with patch("antigravity_adapter.sidecar.worker.subprocess.run") as run:
-                run.return_value.returncode = 0
-                pending = old_state.send("conversation", "hello", "request-1")
+            transcript = self.transcript(old_state)
+            pending = self.dispatch(old_state, transcript)
             new_state = self.make_state(directory)
             outcome = new_state.stop({"conversationId":"conversation", "fullyIdle":True, "transcriptPath":str(transcript)})
         self.assertEqual(outcome, "unknown_stop")
@@ -506,6 +716,32 @@ class SidecarCorrelationTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_http_result_endpoint_refreshes_real_transcript_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            transcript = self.transcript(state)
+            pending = self.dispatch(state, transcript)
+            self.write_records(transcript, self.final_records(pending, "through http"))
+            server = worker.Server(("127.0.0.1", 0), worker.Handler)
+            server.state = state
+            server.token = "test-token"
+            server.instance_id = "test-instance"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            endpoint = f"http://127.0.0.1:{server.server_address[1]}/result/{pending.request_id}"
+            req = urllib_request.Request(
+                endpoint,
+                headers={"Authorization":"Bearer test-token", "X-Sidecar-Instance":"test-instance"},
+            )
+            try:
+                with urllib_request.urlopen(req, timeout=2) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+        self.assertEqual(body, {"requestId":"request-1", "status":"completed", "text":"through http"})
 
 
 if __name__ == "__main__": unittest.main()
