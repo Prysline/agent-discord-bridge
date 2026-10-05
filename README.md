@@ -7,7 +7,7 @@
 ## 目前狀態
 
 - Codex：已遷入既有、通過測試的 Discord bridge 與 persistent adapter core。
-- Antigravity：persistent adapter、exact existing-conversation resolver、authenticated Sidecar client、bounded transcript result recovery 與 heterogeneous composition 已在本機實作並通過自動測試；尚未完成修正後的 cross-adapter 真人 Discord E2E。
+- Antigravity：persistent adapter、exact existing-conversation resolver、authenticated Sidecar client、bounded transcript result recovery 與 heterogeneous composition 已在本機實作並通過自動測試；Codex + Antigravity cross-adapter 真人 Discord E2E 已通過。
 - 共用 shared core：已依 frozen contract 建立 canonical event log、persistent event-delta cursor、human-turn／bounded-discussion orchestration、AgentResult validation 與 delivery/contextCommit fence；root composition 可依 participant 設定選用 Codex 或 Antigravity adapter。
 - Claude Code：未 bundled、未驗證；未來可依公開 adapter contract 由有環境者提交 PR。
 
@@ -54,9 +54,9 @@ python -m pip install -r requirements.txt
 
 `bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID／Antigravity conversation ID 只存在各自 adapter-local resolver。設定矛盾會 fail closed，不會建立或替換 native session。真實 Token、numeric ID、native session ID 與 persona 不得提交。
 
-Antigravity Sidecar 的追蹤範例位於 `antigravity_adapter/sidecar/sidecar.example.json`；安裝時須把 rendezvous 與 transcript root placeholders 換成本機設定。transcript root 必須明確指向包含各 conversation subtree 的 Antigravity brain root；worker 不猜 home、使用者名稱或私人路徑。`agentapi send-message` 負責 dispatch，`/result` 以 dispatch 前 byte offset、file identity、唯一 request marker 與 bounded JSONL delta 恢復 final；Stop hook 可用相同 extractor 提前完成，但只是 optional fast path。worker 只監聽 `127.0.0.1`，每次啟動輪替 bearer token 與 instance identity，並從 Antigravity 注入的 PATH discovery `agentapi`；不支援的 wrapper 會拒絕啟動，不會退回 CDP 或猜測安裝路徑。
+Antigravity Sidecar 的追蹤範例位於 `antigravity_adapter/sidecar/sidecar.example.json`；安裝時須把 rendezvous 與 transcript root placeholders 換成本機設定。transcript root 必須明確指向包含各 conversation subtree 的 Antigravity brain root；worker 不猜 home、使用者名稱或私人路徑。`agentapi send-message` 負責 dispatch，`/result` 以 dispatch 前 byte offset、file identity、唯一 request marker 與 bounded JSONL delta 恢復 final；Stop hook 可用相同 extractor 提前完成，但只是 optional fast path。worker 只監聽 `127.0.0.1`，每次啟動輪替 bearer token 與 instance identity，並從 Antigravity 注入的 PATH discovery `agentapi`；不支援的 wrapper 會拒絕啟動，不會退回 CDP 或猜測安裝路徑。Windows runtime 另以 opaque named mutex、exclusive loopback socket 與經 creation-time驗證的 parent process handle保護單一 instance；parent watcher以 owned cancellation event安全退出，parent結束時 worker自行 shutdown。Rendezvous以 Windows atomic no-replace primitive發布；既有 live、stale 或無法判定 ownership 的 artifact一律 fail closed，worker不會覆寫它，也不會掃描或終止未知 process。
 
-設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 使用 bootstrap existing binding 與 shared canonical event-delta；此模式不讀 Discord recent history、不建立 native session，也不在失敗時 fallback legacy execution。`config.json` 的 participant 以 `adapter: codex|antigravity` 選擇 composition；Antigravity 另需把 `ANTIGRAVITY_RENDEZVOUS_PATH` 指向 Sidecar 每次啟動 atomic 發布的 gitignored runtime file。`!stop` 仍只走 shared invalidation；Antigravity 目前準確宣告 `canCancelInFlight=false`，late result 不能越過 core token。cross-adapter 真人 E2E、chunking 與 durable persistence尚未完成。
+設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 使用 bootstrap existing binding 與 shared canonical event-delta；此模式不讀 Discord recent history、不建立 native session，也不在失敗時 fallback legacy execution。`config.json` 的 participant 以 `adapter: codex|antigravity` 選擇 composition；Antigravity 另需把 `ANTIGRAVITY_RENDEZVOUS_PATH` 指向 Sidecar 每次啟動 atomic 發布的 gitignored runtime file。`!stop` 仍只走 shared invalidation；Antigravity 目前準確宣告 `canCancelInFlight=false`，late result 不能越過 core token。cross-adapter 真人 E2E 已完成；chunking 與 durable persistence尚未完成。
 
 ## 驗證
 
@@ -66,7 +66,7 @@ python -m unittest discover -s tests -v
 git diff --check
 ```
 
-自動測試不會登入 Discord，也不會使用真實 Token。Codex human-turn root path 已完成一次真人 Manual E2E；Antigravity hookless recovery 目前只完成本機自動驗證，bounded discussion、修正後的 cross-adapter 往返與 cross-adapter `!stop` 仍需使用真實 participant bindings 另做 Manual E2E，不能由本機測試推定完成。
+自動測試不會登入 Discord，也不會使用真實 Token。Codex human-turn root path 與 Codex + Antigravity bounded discussion（含 human intervention 與 in-flight `!stop`）均已完成一次真人 Manual E2E。這些結果不代表已部署、CI verified、durable crash recovery 或完整 production rollout。
 
 ## 授權與來源
 

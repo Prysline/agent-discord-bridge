@@ -32,7 +32,7 @@ Discord ingress
 
 `agent_bridge/contracts.py` 是 wiring 使用的 shared request／result validator；`codex_adapter/contracts.py` 保留 Codex result helpers，但重用同一份 shared AgentRequest validation，避免 schema 漂移。
 
-這些元件尚未持久化。Root Discord entry 已有 opt-in human-turn 與 bounded-discussion driver；driver 只反覆呼叫 shared core 選出的合法 turn，並讓 `!stop` 在 in-flight request 期間進入既有 stop／reconciliation lifecycle。Participant、quota 與 exact existing binding 由本機設定提供，root 不另建 scheduler。Peer ingestion、durable restart 與完整 production cutover仍未接線；bounded discussion 也尚未完成真人 Discord E2E。
+這些元件尚未持久化。Root Discord entry 已有 opt-in human-turn 與 bounded-discussion driver；driver 只反覆呼叫 shared core 選出的合法 turn，並讓 `!stop` 在 in-flight request 期間進入既有 stop／reconciliation lifecycle。Participant、quota 與 exact existing binding 由本機設定提供，root 不另建 scheduler。Peer ingestion、durable restart 與完整 production cutover仍未接線；Codex + Antigravity bounded discussion 真人 Discord E2E 已完成。
 
 ## Shared conversation policy
 
@@ -54,8 +54,8 @@ Discord ingress
 1. 以已提交且完成 Phase 1.5 驗證的 Codex 程式建立乾淨基線。
 2. 為 shared conversation policy 補上 frozen contract state machine 與回歸測試。（已完成）
 3. 建立 canonical log、event-delta cursor、shared contracts 與 orchestrator wiring target。（已完成 memory-only core）
-4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，將 Codex Discord human-turn 與 bounded-discussion root 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。（本機 wiring 已完成；bounded discussion Manual E2E pending）
-5. 以既有 probe evidence 建立 Antigravity exact binding、authenticated Sidecar transport、bounded transcript result recovery 與 persistent adapter，並在 composition layer 依 participant 選擇 runtime。（已完成本機實作與 automated integration；修正後的真人 cross-adapter E2E pending）
+4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，將 Codex Discord human-turn 與 bounded-discussion root 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。（本機 wiring 與 bounded discussion Manual E2E 已完成）
+5. 以既有 probe evidence 建立 Antigravity exact binding、authenticated Sidecar transport、bounded transcript result recovery 與 persistent adapter，並在 composition layer 依 participant 選擇 runtime。（已完成本機實作、automated integration 與真人 cross-adapter E2E）
 6. 兩個 adapter 均通過共用 contract tests 後，才處理舊 fork 的退場或薄化。（contract regression 已接入 full suite；舊 fork 尚未退場）
 
 ## Antigravity adapter
@@ -66,7 +66,9 @@ Sidecar `/send` 接受後才回報 confirmed invocation；送出結果不明則�
 
 唯一 positive result 才把 context 判為 committed；無法相關時維持 unknown，不 replay。正式模型輸出目前一律映射為 `continue`，不自行發明 `complete`／`abstain` parser。平台沒有已證明的強 cancellation，因此 capability 是 `canCancelInFlight=false`；core invalidation 仍保證 late output 不會被送往 Discord或推進 discussion。
 
-目前 hookless recovery 已使用 real temporary filesystem、production Sidecar State 與 fake `agentapi` subprocess 測試；尚未重新驗證真實 Antigravity Sidecar、真實 Codex binding 與 Discord 同場往返，因此不得稱為 production-ready 或 cross-adapter E2E verified。Sidecar request state 仍只存在 process memory，restart 後不提供 durable recovery。
+Hookless recovery 已使用 real temporary filesystem、production Sidecar State 與 fake `agentapi` subprocess 測試，真實 Antigravity Sidecar、Codex binding 與 Discord 同場往返也已完成 Manual E2E。Sidecar request state仍只存在 process memory，restart 後不提供 durable recovery，因此不得稱為 production-ready。
+
+Windows Sidecar lifecycle 使用三道獨立防線：由 canonical rendezvous path 的 opaque digest 衍生 named mutex、以 `SO_EXCLUSIVEADDRUSE` 獨占 loopback port，以及持有 spawning parent 的 process handle。Parent HANDLE會以 process creation time排除 PID reuse，watcher使用 owned cancellation event並在關閉 HANDLE前完成 join。Rendezvous在相同 volume以 atomic no-replace方式發布；Parent process結束時 worker停止接受新 request、關閉 listener，並只在 `instanceId + token` 均仍屬於自己時移除 artifact，最後才釋放 mutex。已存在的 live、stale 或 ambiguous rendezvous都會保留並拒絕啟動；port conflict同樣 fail closed。這是為了防範 supervisor未清理 child的歷史行為，但不代表 upstream已修復，也不提供 durable crash recovery或自動清除未知 orphan process。
 
 ## 不在初始快照中的功能
 

@@ -14,7 +14,6 @@ import re
 import secrets
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -22,6 +21,19 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+if __package__:
+    from .lifecycle import (
+        ExclusiveSocketMixin, Lifecycle, LifecycleFailure, ParentHandle,
+        WindowsMutex, classify_existing_rendezvous, mutex_name,
+        publish_exclusive, remove_owned_rendezvous,
+    )
+else:
+    from lifecycle import (  # type: ignore[no-redef]
+        ExclusiveSocketMixin, Lifecycle, LifecycleFailure, ParentHandle,
+        WindowsMutex, classify_existing_rendezvous, mutex_name,
+        publish_exclusive, remove_owned_rendezvous,
+    )
 
 
 MAX_BODY = 1024 * 1024
@@ -296,7 +308,9 @@ class State:
         self.pending_id = None
 
 
-class Server(ThreadingHTTPServer):
+class Server(ExclusiveSocketMixin, ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
     state: State
     token: str
     instance_id: str
@@ -373,15 +387,24 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409 if code in {"busy", "duplicate_request"} else 502, {"accepted":False, "error":code})
 
 
-def publish(path: Path, port: int, token: str, instance_id: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps({"host":"127.0.0.1", "port":port, "instanceId":instance_id, "token":token}, separators=(",", ":"))
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+def create_server(port: int) -> Server:
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream: stream.write(data)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary): os.unlink(temporary)
+        return Server(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        raise LifecycleFailure("port_conflict") from exc
+
+
+def publish(path: Path, port: int, token: str, instance_id: str) -> None:
+    data = json.dumps({"host":"127.0.0.1", "port":port, "instanceId":instance_id, "token":token}, separators=(",", ":"))
+    publish_exclusive(path, data)
+
+
+def cleanup(server: Server | None, path: Path, lifecycle: Lifecycle | None) -> None:
+    if server is not None:
+        server.server_close()
+        remove_owned_rendezvous(path, server.instance_id, server.token)
+    if lifecycle is not None:
+        lifecycle.close()
 
 
 def main() -> None:
@@ -392,20 +415,29 @@ def main() -> None:
     parser.add_argument("--transcript-root", type=Path, required=True)
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535 or args.timeout_seconds < 1: raise SystemExit("invalid Sidecar settings")
-    server = Server(("127.0.0.1", args.port), Handler)
-    server.state = State(args.timeout_seconds, args.transcript_root)
-    server.token = secrets.token_hex(32)
-    server.instance_id = uuid.uuid4().hex
-    publish(args.rendezvous, args.port, server.token, server.instance_id)
+    lifecycle = None
+    server = None
     try:
-        server.serve_forever(poll_interval=0.1)
-    finally:
-        server.server_close()
+        state = State(args.timeout_seconds, args.transcript_root)
+        mutex = WindowsMutex(mutex_name(args.rendezvous))
         try:
-            current = json.loads(args.rendezvous.read_text(encoding="utf-8"))
-            if current.get("instanceId") == server.instance_id: args.rendezvous.unlink()
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
+            parent = ParentHandle()
+        except Exception:
+            mutex.close()
+            raise
+        lifecycle = Lifecycle(mutex, parent)
+        classify_existing_rendezvous(args.rendezvous)
+        server = create_server(args.port)
+        server.state = state
+        server.token = secrets.token_hex(32)
+        server.instance_id = uuid.uuid4().hex
+        publish(args.rendezvous, args.port, server.token, server.instance_id)
+        parent.watch(server.shutdown)
+        server.serve_forever(poll_interval=0.1)
+    except LifecycleFailure as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        cleanup(server, args.rendezvous, lifecycle)
 
 
 if __name__ == "__main__": main()

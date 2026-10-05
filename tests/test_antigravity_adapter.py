@@ -1,11 +1,15 @@
 import asyncio
 import json
+import os
+import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib import error, request as urllib_request
 
 from agent_bridge import ConversationPolicy, Participant
@@ -16,6 +20,7 @@ from antigravity_adapter.binding_bootstrap import bootstrap_existing_bindings
 from antigravity_adapter.persistent import AntigravityPersistentAdapter
 from antigravity_adapter.transport import SidecarAmbiguous, SidecarHttpClient, SidecarRejected, SidecarUnavailable
 from antigravity_adapter.sidecar import worker
+from antigravity_adapter.sidecar import lifecycle
 from codex_adapter.app_server import TurnReference
 from codex_adapter.persistent import CodexPersistentAdapter
 from codex_adapter.root_composition import parse_root_discussion_settings
@@ -750,6 +755,217 @@ class SidecarCorrelationTests(unittest.TestCase):
             "text":"through http",
             "recoverySource":"polling",
         })
+
+
+@unittest.skipUnless(os.name == "nt", "Windows lifecycle contract")
+class SidecarLifecycleTests(unittest.TestCase):
+    def test_worker_supports_supervisor_direct_file_entrypoint(self):
+        completed = subprocess.run(
+            [sys.executable, worker.__file__, "--help"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_named_mutex_rejects_duplicate_and_releases_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            name = lifecycle.mutex_name(Path(directory) / "runtime.json")
+            first = lifecycle.WindowsMutex(name)
+            try:
+                with self.assertRaisesRegex(lifecycle.LifecycleFailure, "instance_conflict"):
+                    lifecycle.WindowsMutex(name)
+            finally:
+                first.close()
+            replacement = lifecycle.WindowsMutex(name)
+            replacement.close()
+
+    def test_mutex_identity_uses_canonical_windows_path(self):
+        base = Path.cwd() / "mutex-fixture" / "runtime.json"
+        equivalents = [
+            base,
+            Path(str(base).upper()),
+            Path(str(base).replace("\\", "/")),
+            base.parent / "." / "child" / ".." / base.name,
+            Path(os.path.relpath(base, Path.cwd())),
+        ]
+        self.assertEqual(len({lifecycle.mutex_name(path) for path in equivalents}), 1)
+
+    def test_exclusive_socket_rejects_existing_listener_without_terminating_it(self):
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        try:
+            with self.assertRaisesRegex(lifecycle.LifecycleFailure, "port_conflict"):
+                worker.create_server(listener.getsockname()[1])
+            self.assertIsNotNone(listener.getsockname())
+        finally:
+            listener.close()
+
+    def test_live_stale_and_ambiguous_rendezvous_fail_closed_untouched(self):
+        class ReadyState:
+            command_type = "test"
+            pending_id = None
+            def expire(self): return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.json"
+            server = worker.Server(("127.0.0.1", 0), worker.Handler)
+            server.state = ReadyState()
+            server.token = "token"
+            server.instance_id = "instance"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            live = json.dumps({"host":"127.0.0.1", "port":server.server_address[1], "instanceId":"instance", "token":"token"})
+            path.write_text(live, encoding="utf-8")
+            try:
+                with self.assertRaisesRegex(lifecycle.LifecycleFailure, "live_instance_conflict"):
+                    lifecycle.classify_existing_rendezvous(path)
+                self.assertEqual(path.read_text(encoding="utf-8"), live)
+
+                mismatch = json.dumps({"host":"127.0.0.1", "port":server.server_address[1], "instanceId":"instance", "token":"wrong"})
+                path.write_text(mismatch, encoding="utf-8")
+                with self.assertRaisesRegex(lifecycle.LifecycleFailure, "rendezvous_conflict"):
+                    lifecycle.classify_existing_rendezvous(path)
+                self.assertEqual(path.read_text(encoding="utf-8"), mismatch)
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+            probe = socket.socket(); probe.bind(("127.0.0.1", 0)); stale_port = probe.getsockname()[1]; probe.close()
+            stale = json.dumps({"host":"127.0.0.1", "port":stale_port, "instanceId":"old", "token":"old"})
+            path.write_text(stale, encoding="utf-8")
+            refused = error.URLError(ConnectionRefusedError(10061, "refused"))
+            with patch("antigravity_adapter.sidecar.lifecycle.urllib.request.urlopen", side_effect=refused):
+                with self.assertRaisesRegex(lifecycle.LifecycleFailure, "stale_rendezvous"):
+                    lifecycle.classify_existing_rendezvous(path)
+            self.assertEqual(path.read_text(encoding="utf-8"), stale)
+
+            path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(lifecycle.LifecycleFailure, "rendezvous_conflict"):
+                lifecycle.classify_existing_rendezvous(path)
+            self.assertEqual(path.read_text(encoding="utf-8"), "{}")
+
+    def test_cleanup_requires_both_instance_and_token_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.json"
+            replacement = {"instanceId":"new", "token":"new"}
+            path.write_text(json.dumps(replacement), encoding="utf-8")
+            lifecycle.remove_owned_rendezvous(path, "old", "old")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), replacement)
+            lifecycle.remove_owned_rendezvous(path, "new", "new")
+            self.assertFalse(path.exists())
+
+    def test_atomic_publication_loses_race_without_overwriting_foreign_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.json"
+            original_move = lifecycle._move_no_replace
+
+            def competing_move(source, destination):
+                destination.write_text("foreign", encoding="utf-8")
+                return original_move(source, destination)
+
+            with patch("antigravity_adapter.sidecar.lifecycle._move_no_replace", side_effect=competing_move):
+                with self.assertRaisesRegex(lifecycle.LifecycleFailure, "rendezvous_conflict"):
+                    lifecycle.publish_exclusive(path, "owned")
+            self.assertEqual(path.read_text(encoding="utf-8"), "foreign")
+            self.assertEqual(list(path.parent.glob("runtime.json.*.tmp")), [])
+
+    def test_cleanup_removes_owned_artifact_before_releasing_mutex(self):
+        events = []
+        class Server:
+            instance_id = "instance"
+            token = "token"
+            def server_close(self): events.append("server_closed")
+        class Resource:
+            def __init__(self, name): self.name = name
+            def close(self): events.append(self.name)
+        owner = lifecycle.Lifecycle(Resource("mutex_released"), Resource("parent_resources_closed"))
+        with patch("antigravity_adapter.sidecar.worker.remove_owned_rendezvous", side_effect=lambda *_: events.append("rendezvous_cleanup_completed")):
+            worker.cleanup(Server(), Path("unused"), owner)
+        self.assertEqual(events, ["server_closed", "rendezvous_cleanup_completed", "parent_resources_closed", "mutex_released"])
+
+    def test_partial_startup_cleanup_touches_only_owned_resources(self):
+        events = []
+        class Resource:
+            def __init__(self, name): self.name = name
+            def close(self): events.append(self.name)
+        owner = lifecycle.Lifecycle(Resource("mutex"), Resource("parent"))
+        with tempfile.TemporaryDirectory() as directory:
+            foreign = Path(directory) / "runtime.json"
+            foreign.write_text("foreign", encoding="utf-8")
+            worker.cleanup(None, foreign, owner)
+            self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign")
+        self.assertEqual(events, ["parent", "mutex"])
+
+    def test_parent_handle_signals_original_process_object(self):
+        process = subprocess.Popen(["powershell", "-NoProfile", "-Command", "Start-Sleep -Milliseconds 300"])
+        observed = threading.Event()
+        handle = lifecycle.ParentHandle(process.pid, _worker_created=(1 << 64) - 1)
+        try:
+            handle.watch(observed.set)
+            process.wait(timeout=3)
+            self.assertTrue(observed.wait(2))
+        finally:
+            handle.close()
+            if process.poll() is None: process.terminate()
+
+    def test_reused_parent_pid_is_rejected_and_opened_handle_closed(self):
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 123
+        with patch("antigravity_adapter.sidecar.lifecycle._creation_time", return_value=200):
+            with self.assertRaisesRegex(lifecycle.LifecycleFailure, "parent_watch_unavailable"):
+                lifecycle.ParentHandle(42, _kernel32=kernel32, _worker_created=100)
+        kernel32.CloseHandle.assert_called_once_with(123)
+        kernel32.CreateEventW.assert_not_called()
+
+    def test_normal_close_cancels_and_joins_active_parent_waiter(self):
+        called = threading.Event()
+        handle = lifecycle.ParentHandle(os.getppid())
+        thread = handle.watch(called.set)
+        handle.close()
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(called.is_set())
+
+    def test_watcher_start_failure_keeps_cleanup_safe(self):
+        handle = lifecycle.ParentHandle(os.getppid())
+        with patch("antigravity_adapter.sidecar.lifecycle.threading.Thread.start", side_effect=RuntimeError("start failed")):
+            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                handle.watch(lambda: None)
+        handle.close()
+
+    def test_parent_death_and_cleanup_race_joins_before_handle_close(self):
+        process = subprocess.Popen(["powershell", "-NoProfile", "-Command", "Start-Sleep -Milliseconds 150"])
+        entered, release = threading.Event(), threading.Event()
+        handle = lifecycle.ParentHandle(process.pid, _worker_created=(1 << 64) - 1)
+        def callback():
+            entered.set(); release.wait(2)
+        watcher = handle.watch(callback)
+        process.wait(timeout=3)
+        self.assertTrue(entered.wait(2))
+        closer = threading.Thread(target=handle.close)
+        closer.start()
+        self.assertTrue(closer.is_alive())
+        release.set(); closer.join(2)
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(watcher.is_alive())
+
+    def test_parent_watch_unavailable_fails_closed_and_cleanup_is_idempotent(self):
+        with patch("antigravity_adapter.sidecar.lifecycle.ctypes.WinDLL") as dll:
+            dll.return_value.OpenProcess.return_value = 0
+            with self.assertRaisesRegex(lifecycle.LifecycleFailure, "parent_watch_unavailable"):
+                lifecycle.ParentHandle(123)
+
+        class Resource:
+            def __init__(self): self.closed = 0
+            def close(self): self.closed += 1
+        mutex, parent = Resource(), Resource()
+        owner = lifecycle.Lifecycle(mutex, parent)
+        owner.close(); owner.close()
+        self.assertEqual((mutex.closed, parent.closed), (1, 1))
+
+    def test_production_lifecycle_never_kills_or_enumerates_processes(self):
+        source = Path(lifecycle.__file__).read_text(encoding="utf-8")
+        for forbidden in ("taskkill", "TerminateProcess", "Win32_Process", "python.exe"):
+            self.assertNotIn(forbidden, source)
 
 
 if __name__ == "__main__": unittest.main()
