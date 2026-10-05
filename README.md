@@ -60,6 +60,26 @@ Antigravity Sidecar 的追蹤範例位於 `antigravity_adapter/sidecar/sidecar.e
 
 ## 驗證
 
+### 本機 Agent 管理前台
+
+先複製 `agent-management.example.json` 為 gitignored 的
+`agent-management.local.json`，再啟動：
+
+```powershell
+python -m agent_bridge.admin_ui
+```
+
+前台只監聽 `127.0.0.1:8766`，可編輯 Agent、adapter、討論額度與
+Discord Sender。既有 Agent ID 為唯讀；Binding 只顯示狀態，不提供 create、
+rebind、retire 或 generation mutation。Token 只會顯示「已設定」，留白表示保留
+原值。儲存採完整驗證後的單檔 atomic replace，並於重新啟動 Bot 後生效。
+
+若沒有 `agent-management.local.json`，既有 `config.json` participants 與
+`DISCORD_TOKEN` / `BOT_USER_ID` 會組成相容的 `legacy-default` sender。多個啟用
+Agent 共用同一 Sender 時，Discord 顯示會自動加上 `<displayName>: `；專屬
+Sender 不強制署名。Sender 不存在、未登入或無法存取頻道時一律 fail closed，
+不會改用其他 Bot 冒名發送。
+
 ```powershell
 python -m py_compile bot.py conversation_policy.py agent_bridge\conversation_policy.py
 python -m unittest discover -s tests -v

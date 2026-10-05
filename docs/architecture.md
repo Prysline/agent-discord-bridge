@@ -36,6 +36,14 @@ Discord ingress
 
 ## Shared conversation policy
 
+### Agent 管理與 Discord Sender
+
+`agent-management.local.json` 是 gitignored 的單一管理寫入邊界；本機前台只綁定
+loopback，使用同源檢查與 CSRF token，API 永不回傳 Bot Token。設定檔不存在時
+沿用 legacy root Bot。Outbound delivery 以 `agent_id -> senderId -> Discord client`
+路由；多 Agent 共用 sender 時只在 Discord body 加顯示名稱，canonical content
+保持原文。額外 sender client 僅負責 outbound，不參與 ingress。
+
 `agent_bridge/conversation_policy.py` 是 core-owned deterministic state machine：
 
 - `!discuss` 以 mention 順序固定 participants 與 round-robin；錯誤 participant 使整次 start 失敗。

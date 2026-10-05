@@ -20,7 +20,8 @@ import discord
 import websockets
 from dotenv import load_dotenv
 
-from agent_bridge.discord_delivery import DiscordRoomDelivery
+from agent_bridge.agent_management import load_agent_management
+from agent_bridge.discord_delivery import DiscordSenderDelivery
 from agent_bridge.heterogeneous_composition import compose_existing_heterogeneous_root
 from agent_bridge.root_shared import safe_failure_message
 from antigravity_adapter.transport import SidecarHttpClient
@@ -65,6 +66,11 @@ SHARED_BINDINGS_PATH = (
     if SHARED_BINDINGS_PATH_RAW.is_absolute()
     else BOT_DIR / SHARED_BINDINGS_PATH_RAW
 ).resolve()
+AGENT_MANAGEMENT_PATH_RAW = Path(os.getenv("AGENT_MANAGEMENT_PATH", "agent-management.local.json"))
+AGENT_MANAGEMENT_PATH = (
+    AGENT_MANAGEMENT_PATH_RAW if AGENT_MANAGEMENT_PATH_RAW.is_absolute()
+    else BOT_DIR / AGENT_MANAGEMENT_PATH_RAW
+).resolve()
 ANTIGRAVITY_RENDEZVOUS_PATH_RAW = Path(
     os.getenv("ANTIGRAVITY_RENDEZVOUS_PATH", "antigravity-sidecar.runtime.json")
 )
@@ -83,6 +89,9 @@ THREAD_MAP_PATH = TEMP_DIR / "threads.json"
 with open(BOT_DIR / "config.json", encoding="utf-8") as f:
     CONFIG = json.load(f)
 validate_config(CONFIG)
+AGENT_MANAGEMENT = load_agent_management(
+    AGENT_MANAGEMENT_PATH, CONFIG, TOKEN or "", BOT_USER_ID
+)
 
 if not CODEX_CWD.is_dir():
     raise RuntimeError(f"CODEX_CWD 不存在或不是資料夾: {CODEX_CWD}")
@@ -892,7 +901,7 @@ codex_client = CodexAppServerClient(
     retry_base_sec=CODEX_RETRY_BASE_SEC,
 )
 
-shared_delivery: DiscordRoomDelivery | None = None
+shared_delivery: DiscordSenderDelivery | None = None
 shared_app_client: SharedCodexAppServerClient | None = None
 shared_root = None
 if SHARED_CORE_ENABLED:
@@ -900,12 +909,22 @@ if SHARED_CORE_ENABLED:
         raise RuntimeError("SHARED_AGENT_ID is required when shared core is enabled")
     if CODEX_TRANSPORT != "stdio":
         raise RuntimeError("shared core currently requires CODEX_TRANSPORT=stdio")
-    shared_delivery = DiscordRoomDelivery()
+    shared_delivery = DiscordSenderDelivery(AGENT_MANAGEMENT)
     shared_command = resolve_codex_command(CODEX_PATH)
     shared_app_client = SharedCodexAppServerClient(
         lambda: SharedStdioTransport(shared_command, CODEX_CWD)
     )
-    shared_discussion = parse_root_discussion_settings(CONFIG)
+    managed_config = json.loads(json.dumps(CONFIG))
+    managed_config.setdefault("sharedDiscussion", {})["participants"] = [
+        {
+            "agentId": item.agent_id, "adapter": item.adapter,
+            "mentionId": item.mention_id, "displayName": item.display_name,
+            "budgetChars": item.budget_chars, "maxCalls": item.max_calls,
+            "enabled": item.enabled, "available": item.available,
+        }
+        for item in AGENT_MANAGEMENT.agents
+    ]
+    shared_discussion = parse_root_discussion_settings(managed_config)
     shared_root = compose_existing_heterogeneous_root(
         binding_path=SHARED_BINDINGS_PATH,
         primary_agent_id=SHARED_AGENT_ID,
@@ -989,6 +1008,28 @@ intents.message_content = True
 intents.dm_messages = True
 
 client = discord.Client(intents=intents)
+sender_clients: dict[str, discord.Client] = {}
+sender_tasks: dict[str, asyncio.Task] = {}
+if SHARED_CORE_ENABLED:
+    assert shared_delivery is not None
+    for sender in AGENT_MANAGEMENT.senders:
+        if not sender.enabled:
+            continue
+        if sender.bot_user_id == str(BOT_USER_ID) and sender.token == TOKEN:
+            shared_delivery.register_sender(sender.sender_id, client)
+        else:
+            sender_client = discord.Client(intents=discord.Intents.none())
+            sender_clients[sender.sender_id] = sender_client
+            shared_delivery.register_sender(sender.sender_id, sender_client)
+
+
+def report_sender_task(sender_id: str, task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.error("Discord Sender 無法登入或已中斷: sender=%s", sender_id)
 
 channel_locks: dict[int, asyncio.Lock] = {}
 shared_discussion_tasks: dict[str, asyncio.Task] = {}
@@ -1144,6 +1185,17 @@ async def send_codex_reply(message: discord.Message, text: str | None) -> bool:
 async def on_ready():
     log.info(f"{BOT_DISPLAY_NAME} Listener Bot 已上線: {client.user} (ID: {client.user.id})")
     try:
+        for sender in AGENT_MANAGEMENT.senders:
+            sender_client = sender_clients.get(sender.sender_id)
+            current = sender_tasks.get(sender.sender_id)
+            if sender_client is not None and (current is None or current.done()):
+                task = asyncio.create_task(
+                    sender_client.start(sender.token)
+                )
+                task.add_done_callback(
+                    lambda completed, sender_id=sender.sender_id: report_sender_task(sender_id, completed)
+                )
+                sender_tasks[sender.sender_id] = task
         if SHARED_CORE_ENABLED:
             assert shared_app_client is not None
             await shared_app_client.connect()

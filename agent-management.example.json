@@ -1,0 +1,24 @@
+{
+  "agents": [
+    {
+      "agentId": "AGENT_A",
+      "displayName": "Agent A",
+      "adapter": "codex",
+      "mentionId": "123456789012345678",
+      "senderId": "shared-main",
+      "enabled": true,
+      "available": true,
+      "budgetChars": 2000,
+      "maxCalls": 5
+    }
+  ],
+  "senders": [
+    {
+      "senderId": "shared-main",
+      "label": "Shared AI Bot",
+      "botUserId": "123456789012345678",
+      "token": "",
+      "enabled": false
+    }
+  ]
+}

@@ -11,4 +11,5 @@ temp/
 config.json
 persona.md
 bindings.local.json
+agent-management.local.json
 antigravity-sidecar.runtime.json
