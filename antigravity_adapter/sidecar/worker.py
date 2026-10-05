@@ -75,6 +75,7 @@ class Pending:
     status: str = "pending"
     text: str | None = None
     error: dict[str, str] | None = None
+    recovery_source: str | None = None
 
 
 class State:
@@ -97,7 +98,7 @@ class State:
             if not self.pending_id:
                 return
             value = self.requests[self.pending_id]
-            self._recover_locked(value)
+            self._recover_locked(value, "polling")
             if value.status == "pending" and time.monotonic() >= value.deadline:
                 self._error_locked(value, "timeout", "Result recovery timeout")
 
@@ -107,7 +108,7 @@ class State:
             if value is None:
                 return None
             if value.status == "pending":
-                self._recover_locked(value)
+                self._recover_locked(value, "polling")
                 if value.status == "pending" and time.monotonic() >= value.deadline:
                     self._error_locked(value, "timeout", "Result recovery timeout")
             return value
@@ -159,7 +160,7 @@ class State:
             if not self._hook_path_matches(value, payload.get("transcriptPath")):
                 self._error_locked(value, "transcript_unavailable", "Stop transcript unavailable")
                 return "error"
-            self._recover_locked(value)
+            self._recover_locked(value, "stop-hook")
             if value.status == "completed":
                 return "completed"
             if value.status == "error":
@@ -209,7 +210,7 @@ class State:
             return False
         return resolved.is_relative_to(self.transcript_root) and resolved == expected
 
-    def _recover_locked(self, value: Pending) -> None:
+    def _recover_locked(self, value: Pending, recovery_source: str) -> None:
         if value.status != "pending":
             return
         path = value.transcript_path
@@ -277,13 +278,14 @@ class State:
         if len(candidates) != 1:
             self._error_locked(value, "correlation_failed", "Transcript delta was ambiguous")
             return
-        self._complete_locked(value, candidates[0]["content"])
+        self._complete_locked(value, candidates[0]["content"], recovery_source)
 
-    def _complete_locked(self, value: Pending, text: str) -> None:
+    def _complete_locked(self, value: Pending, text: str, recovery_source: str) -> None:
         if value.status != "pending" or self.pending_id != value.request_id:
             return
         value.status = "completed"
         value.text = text
+        value.recovery_source = recovery_source
         self.pending_id = None
 
     def _error_locked(self, value: Pending, code: str, message: str) -> None:
@@ -345,7 +347,9 @@ class Handler(BaseHTTPRequestHandler):
         if value is None:
             self._json(404, {"error":"request_not_found"}); return
         body: dict[str, Any] = {"requestId": value.request_id, "status": value.status}
-        if value.status == "completed": body["text"] = value.text
+        if value.status == "completed":
+            body["text"] = value.text
+            body["recoverySource"] = value.recovery_source
         if value.status == "error": body["error"] = value.error
         self._json(200, body)
 

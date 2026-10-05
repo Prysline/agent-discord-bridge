@@ -418,6 +418,7 @@ class SidecarCorrelationTests(unittest.TestCase):
             recovered = state.result(pending.request_id)
         self.assertEqual(recovered.status, "completed")
         self.assertEqual(recovered.text, "hookless reply")
+        self.assertEqual(recovered.recovery_source, "polling")
         self.assertIsNone(state.pending_id)
 
     def test_delayed_final_remains_pending_then_completes(self):
@@ -569,6 +570,7 @@ class SidecarCorrelationTests(unittest.TestCase):
             self.assertEqual(state.result(pending.request_id).status, "completed")
             self.assertEqual(state.stop({"conversationId":"conversation","fullyIdle":True,"transcriptPath":str(transcript)}), "unknown_stop")
             self.assertEqual(pending.text, "poll wins")
+            self.assertEqual(pending.recovery_source, "polling")
 
         with tempfile.TemporaryDirectory() as directory:
             state = self.make_state(directory)
@@ -577,6 +579,7 @@ class SidecarCorrelationTests(unittest.TestCase):
             self.write_records(transcript, self.final_records(pending, "stop wins"))
             self.assertEqual(state.stop({"conversationId":"conversation","fullyIdle":True,"transcriptPath":str(transcript)}), "completed")
             self.assertEqual(state.result(pending.request_id).text, "stop wins")
+            self.assertEqual(pending.recovery_source, "stop-hook")
 
     def test_missing_marker_remains_pending_and_busy_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -741,7 +744,12 @@ class SidecarCorrelationTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
-        self.assertEqual(body, {"requestId":"request-1", "status":"completed", "text":"through http"})
+        self.assertEqual(body, {
+            "requestId":"request-1",
+            "status":"completed",
+            "text":"through http",
+            "recoverySource":"polling",
+        })
 
 
 if __name__ == "__main__": unittest.main()
