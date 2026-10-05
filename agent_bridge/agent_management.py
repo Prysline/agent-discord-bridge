@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -14,6 +15,7 @@ from typing import Any, Mapping
 class ManagedAgent:
     agent_id: str
     display_name: str
+    agent_alias: str
     adapter: str
     mention_id: str
     sender_id: str
@@ -62,6 +64,7 @@ class AgentManagement:
                 {
                     "agentId": item.agent_id,
                     "displayName": item.display_name,
+                    "agentAlias": item.agent_alias,
                     "adapter": item.adapter,
                     "mentionId": item.mention_id,
                     "senderId": item.sender_id,
@@ -121,6 +124,7 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
         senders.append(DiscordSender(sender_id, label, bot_user_id, token.strip(), enabled))
     agents: list[ManagedAgent] = []
     agent_ids: set[str] = set()
+    enabled_aliases: set[str] = set()
     for index, value in enumerate(raw_agents):
         field = f"agents[{index}]"
         if not isinstance(value, Mapping):
@@ -128,6 +132,9 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
             continue
         agent_id = _text(value.get("agentId"), f"{field}.agentId", errors)
         display_name = _text(value.get("displayName"), f"{field}.displayName", errors)
+        agent_alias = _text(value.get("agentAlias", agent_id), f"{field}.agentAlias", errors)
+        if agent_alias and (not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent_alias) or agent_alias in {"discuss", "stop"}):
+            errors.append(f"{field}.agentAlias: 格式錯誤或使用保留字")
         adapter = value.get("adapter")
         if adapter not in {"codex", "antigravity"}:
             errors.append(f"{field}.adapter: 必須是 codex 或 antigravity")
@@ -141,9 +148,13 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
         if agent_id in agent_ids:
             errors.append(f"{field}.agentId: 重複的 Agent ID")
         agent_ids.add(agent_id)
+        if enabled and agent_alias in enabled_aliases:
+            errors.append(f"{field}.agentAlias: 啟用中的 Agent Alias 必須唯一")
+        if enabled:
+            enabled_aliases.add(agent_alias)
         if sender_id not in sender_ids:
             errors.append(f"{field}.senderId: 找不到對應 Sender")
-        agents.append(ManagedAgent(agent_id, display_name, str(adapter), mention_id, sender_id, enabled, available, budget, calls))
+        agents.append(ManagedAgent(agent_id, display_name, agent_alias, str(adapter), mention_id, sender_id, enabled, available, budget, calls))
     if errors:
         raise ValueError("\n".join(errors))
     return AgentManagement(tuple(agents), tuple(senders))
@@ -156,6 +167,7 @@ def load_agent_management(path: Path, legacy_config: Mapping[str, Any], token: s
     agents = tuple(
         ManagedAgent(
             str(item["agentId"]), str(item.get("displayName", item["agentId"])),
+            str(item.get("agentAlias", item["agentId"])),
             str(item["adapter"]), str(item["mentionId"]), "legacy-default",
             bool(item.get("enabled", True)), bool(item.get("available", True)),
             int(item["budgetChars"]), int(item["maxCalls"]),
@@ -179,7 +191,7 @@ def merge_secret_placeholders(candidate: Mapping[str, Any], current: AgentManage
 def save_agent_management(path: Path, value: AgentManagement) -> None:
     payload = {
         "agents": [
-            {"agentId": a.agent_id, "displayName": a.display_name, "adapter": a.adapter,
+            {"agentId": a.agent_id, "displayName": a.display_name, "agentAlias": a.agent_alias, "adapter": a.adapter,
              "mentionId": a.mention_id, "senderId": a.sender_id, "enabled": a.enabled,
              "available": a.available, "budgetChars": a.budget_chars, "maxCalls": a.max_calls}
             for a in value.agents

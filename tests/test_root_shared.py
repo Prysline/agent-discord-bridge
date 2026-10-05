@@ -118,8 +118,8 @@ def runtime(adapter=None, delivery=None, bindings=None):
 
 def discussion_runtime(*, delivery=None, bindings=None, adapters=None, maximum=3):
     participants = [
-        Participant("agent-a", "101", 2000, 5),
-        Participant("agent-b", "202", 2000, 5),
+        Participant("agent-a", "101", 2000, 5, agent_alias="planner"),
+        Participant("agent-b", "202", 2000, 5, agent_alias="coder"),
     ]
     adapters = adapters or {"agent-a": FakeAdapter(), "agent-b": FakeAdapter()}
     delivery = delivery or FakeDelivery()
@@ -138,10 +138,80 @@ def discussion_runtime(*, delivery=None, bindings=None, adapters=None, maximum=3
         delivery=delivery,
         request_id_factory=lambda: next(request_ids),
     )
-    return RootSharedHumanTurn(core, "agent-a"), adapters, delivery
+    return RootSharedHumanTurn(core, "agent-a", participants), adapters, delivery
 
 
 class RootSharedHumanTurnTests(unittest.TestCase):
+    def test_single_agent_bot_routes_directly_and_strips_ingress_mention(self):
+        bridge, _, _ = runtime()
+        selected = bridge.select_human_target("<@999> hello", 999)
+        self.assertTrue(selected.accepted)
+        self.assertEqual((selected.agent_id, selected.text), ("agent-a", "hello"))
+
+    def test_reply_ingress_preserves_single_and_shared_agent_routing(self):
+        single, _, _ = runtime()
+        selected = single.select_human_target("reply body", 999, allow_without_mention=True)
+        self.assertEqual((selected.accepted, selected.agent_id, selected.text), (True, "agent-a", "reply body"))
+
+        shared, _, _ = discussion_runtime()
+        selected = shared.select_human_target("coder: reply body", 999, allow_without_mention=True)
+        self.assertEqual((selected.accepted, selected.agent_id, selected.text), (True, "agent-b", "reply body"))
+        self.assertFalse(shared.select_human_target("reply body", 999, allow_without_mention=True).accepted)
+
+    def test_disabled_and_unavailable_agents_cannot_be_selected(self):
+        base, _, _ = discussion_runtime()
+        disabled = RootSharedHumanTurn(
+            base.core,
+            "agent-a",
+            [Participant("agent-a", "999", 10, 1, enabled=False, agent_alias="planner")],
+        )
+        self.assertFalse(disabled.select_human_target("<@999> hello", 999).accepted)
+
+        unavailable = RootSharedHumanTurn(
+            base.core,
+            "agent-a",
+            [Participant("agent-a", "999", 10, 1, available=False, agent_alias="planner")],
+        )
+        self.assertFalse(unavailable.select_human_target("<@999> hello", 999).accepted)
+
+    def test_shared_bot_requires_exact_alias_and_strips_only_selector(self):
+        bridge, _, _ = discussion_runtime()
+        selected = bridge.select_human_target("<@999> coder: 請評論 planner: hello", 999)
+        self.assertTrue(selected.accepted)
+        self.assertEqual((selected.agent_id, selected.text), ("agent-b", "請評論 planner: hello"))
+        for text in ("<@999> hello", "<@999> missing: hello"):
+            rejected = bridge.select_human_target(text, 999)
+            self.assertFalse(rejected.accepted)
+            self.assertIn("planner", rejected.hint)
+            self.assertIn("coder", rejected.hint)
+
+    def test_shared_bot_selected_agent_receives_stripped_canonical_text(self):
+        bridge, adapters, _ = discussion_runtime()
+        selected = bridge.select_human_target("<@999> coder: inspect this", 999)
+        result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text=selected.text, mentions_agent=True, target_agent_id=selected.agent_id))
+        self.assertEqual(result.outcomes[0].action, "delivered")
+        self.assertFalse(adapters["agent-a"].requests)
+        request = adapters["agent-b"].requests[0]
+        self.assertEqual(request["context"]["events"][0]["text"], "inspect this")
+
+    def test_selected_prompt_cannot_be_reclassified_as_control(self):
+        bridge, adapters, _ = discussion_runtime()
+        selected = bridge.select_human_target("<@999> planner: !stop", 999)
+        result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text=selected.text, mentions_agent=True, target_agent_id=selected.agent_id))
+        self.assertEqual(result.action, "handled")
+        self.assertEqual(bridge.core.policy.state("room-1").phase, "idle")
+        self.assertEqual(adapters["agent-a"].requests[0]["context"]["events"][0]["text"], "!stop")
+
+    def test_active_discussion_intervention_needs_no_alias_and_does_not_dispatch(self):
+        bridge, adapters, _ = discussion_runtime(maximum=1)
+        asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="!discuss planner coder -- topic", mentions_agent=True))
+        stripped = bridge.strip_ingress_mention("<@999> one more constraint", 999)
+        self.assertEqual(stripped, "one more constraint")
+        intervention = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text=stripped, mentions_agent=True))
+        self.assertEqual(intervention.action, "discussion-context")
+        self.assertFalse(adapters["agent-a"].requests)
+        self.assertFalse(adapters["agent-b"].requests)
+
     def test_authorized_human_uses_configured_agent_and_event_delta(self):
         bridge, adapter, delivery = runtime()
         result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human-1", display_name="Human", text="hello", mentions_agent=True, timestamp="2026-09-28T00:00:00Z"))
@@ -286,10 +356,11 @@ class RootCompositionTests(unittest.TestCase):
 
     def test_discussion_config_and_composition_include_all_existing_participants(self):
         config = {"sharedDiscussion": {"globalMaxDispatches": 6, "participants": [
-            {"agentId": "agent-a", "adapter": "codex", "mentionId": "101", "displayName": "A", "budgetChars": 1000, "maxCalls": 2},
-            {"agentId": "agent-b", "adapter": "codex", "mentionId": "202", "displayName": "B", "budgetChars": 1200, "maxCalls": 3},
+            {"agentId": "agent-a", "agentAlias": "planner", "adapter": "codex", "mentionId": "999", "displayName": "A", "budgetChars": 1000, "maxCalls": 2},
+            {"agentId": "agent-b", "agentAlias": "coder", "adapter": "codex", "mentionId": "999", "displayName": "B", "budgetChars": 1200, "maxCalls": 3},
         ]}}
         settings = parse_root_discussion_settings(config)
+        self.assertEqual([item.agent_alias for item in settings.participants], ["planner", "coder"])
         raw = {"logicalBindings": [
             {"roomId": "room-1", "agentId": "agent-a", "bindingId": "binding-a", "generations": [7], "activeGeneration": 7},
             {"roomId": "room-1", "agentId": "agent-b", "bindingId": "binding-b", "generations": [4], "activeGeneration": 4},

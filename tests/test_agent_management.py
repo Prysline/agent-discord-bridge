@@ -20,10 +20,10 @@ from agent_bridge.discord_delivery import DiscordSenderDelivery
 def valid_raw():
     return {
         "agents": [
-            {"agentId":"a", "displayName":"Agent A", "adapter":"codex",
+            {"agentId":"a", "displayName":"Agent A", "agentAlias":"planner", "adapter":"codex",
              "mentionId":"123456789012345678", "senderId":"shared", "enabled":True,
              "available":True, "budgetChars":2000, "maxCalls":5},
-            {"agentId":"b", "displayName":"Agent B", "adapter":"antigravity",
+            {"agentId":"b", "displayName":"Agent B", "agentAlias":"coder", "adapter":"antigravity",
              "mentionId":"223456789012345678", "senderId":"shared", "enabled":True,
              "available":True, "budgetChars":2000, "maxCalls":5},
         ],
@@ -70,6 +70,19 @@ class AgentManagementTests(unittest.TestCase):
             with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
                 parse_agent_management(candidate)
 
+    def test_agent_alias_validation_and_enabled_uniqueness(self):
+        cases=[]
+        raw=valid_raw(); raw["agents"][0]["agentAlias"]=""; cases.append((raw,"agentAlias"))
+        raw=valid_raw(); raw["agents"][0]["agentAlias"]="Bad Alias"; cases.append((raw,"格式"))
+        raw=valid_raw(); raw["agents"][0]["agentAlias"]="stop"; cases.append((raw,"保留字"))
+        raw=valid_raw(); raw["agents"][1]["agentAlias"]="planner"; cases.append((raw,"必須唯一"))
+        for candidate, expected in cases:
+            with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
+                parse_agent_management(candidate)
+
+        disabled=valid_raw(); disabled["agents"][1]["agentAlias"]="planner"; disabled["agents"][1]["enabled"]=False
+        self.assertEqual(parse_agent_management(disabled).agents[1].agent_alias,"planner")
+
     def test_secret_blank_keeps_existing_and_explicit_clear_is_validated(self):
         current=parse_agent_management(valid_raw())
         candidate=valid_raw(); candidate["senders"][0]["token"]=""
@@ -95,6 +108,7 @@ class AgentManagementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             value=load_agent_management(Path(directory)/"missing.json",legacy,"legacy-secret",323456789012345678)
         self.assertEqual(value.agents[0].sender_id,"legacy-default")
+        self.assertEqual(value.agents[0].agent_alias,"a")
         self.assertEqual(value.senders[0].token,"legacy-secret")
 
     def test_binding_status_is_read_only_and_adapter_mismatch_rejected(self):
@@ -184,6 +198,9 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertIn("removeAgent",admin_ui.HTML)
                 self.assertIn("removeSender",admin_ui.HTML)
                 self.assertNotIn('data-k="available"',admin_ui.HTML)
+                self.assertNotIn('data-k="mentionId"',admin_ui.HTML)
+                self.assertIn('data-k="agentAlias"',admin_ui.HTML)
+                self.assertIn("一般 human-turn 不使用這兩項額度",admin_ui.HTML)
                 self.assertIn("white-space:nowrap",admin_ui.HTML)
                 state["agents"][0]["displayName"]="Updated Agent"
                 state["senders"][0]["token"]=""

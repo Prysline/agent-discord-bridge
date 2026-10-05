@@ -252,8 +252,9 @@ class SharedOrchestrator:
         mentioned_agents: tuple[str, ...] = (),
         reply_to_event_id: str | None = None,
         timestamp: str | None = None,
+        allow_control: bool = True,
     ) -> CoreOutcome:
-        control = self.policy.classify_control(text)
+        control = self.policy.classify_control(text) if allow_control else None
         if control == "start" and self._has_unresolved_delivery(room_id):
             return CoreOutcome("rejected", reason="delivery pending")
         if control is None:
@@ -267,7 +268,9 @@ class SharedOrchestrator:
                 reply_to_event_id=reply_to_event_id,
                 timestamp=timestamp,
             )
-        transition = self.policy.handle_event(Event(room_id, author_id, False, text))
+        transition = self.policy.handle_event(
+            Event(room_id, author_id, False, text), allow_control=allow_control
+        )
         if transition.action == "started":
             state = self.policy.state(room_id)
             snapshots = {

@@ -61,6 +61,38 @@ class SharedConversationPolicyTests(unittest.TestCase):
                 self.assertEqual(value.state("room").participants, ("a", "b"))
                 self.assertEqual(value.state("room").goal, goal)
 
+    def test_aliases_define_discussion_order_and_preserve_goal(self):
+        value = policy([
+            participant("a", "999", agent_alias="planner"),
+            participant("b", "999", agent_alias="coder"),
+            participant("c", "999", agent_alias="reviewer"),
+        ])
+        result = start(value, "!discuss coder planner -- compare reviewer: notes")
+        self.assertTrue(result.accepted)
+        self.assertEqual(value.state("room").participants, ("b", "a"))
+        self.assertEqual(value.state("room").goal, "compare reviewer: notes")
+
+    def test_alias_start_fails_whole_for_duplicate_unknown_disabled_or_unavailable(self):
+        cases = [
+            (policy([participant("a", "1", agent_alias="planner"), participant("b", "2", agent_alias="coder")]), "!discuss planner planner -- goal", "duplicate participant"),
+            (policy([participant("a", "1", agent_alias="planner"), participant("b", "2", agent_alias="coder")]), "!discuss planner missing -- goal", "unknown participant"),
+            (policy([participant("a", "1", agent_alias="planner"), participant("b", "2", agent_alias="coder", enabled=False)]), "!discuss planner coder -- goal", "disabled participant"),
+            (policy([participant("a", "1", agent_alias="planner"), participant("b", "2", agent_alias="coder", available=False)]), "!discuss planner coder -- goal", "unavailable participant"),
+        ]
+        for value, command, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(start(value, command).reason, reason)
+                self.assertEqual(value.state("room").phase, "idle")
+
+    def test_disabled_duplicate_alias_does_not_shadow_enabled_participant(self):
+        value = policy([
+            participant("a", "1", agent_alias="planner"),
+            participant("old", "2", agent_alias="planner", enabled=False),
+            participant("b", "3", agent_alias="coder"),
+        ])
+        self.assertTrue(start(value, "!discuss planner coder -- goal").accepted)
+        self.assertEqual(value.state("room").participants, ("a", "b"))
+
     def test_empty_goal_is_rejected(self):
         self.assertEqual(
             start(policy(), "!discuss <@101> <@102>").reason,

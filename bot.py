@@ -121,13 +121,18 @@ def remember_bot_message(message_id: int) -> None:
         recent_bot_messages.pop()
 
 
-def access_decision(message: discord.Message) -> AccessDecision:
-    """套用 fail-closed allowlist 與 mention 規則。"""
+def replies_to_root_bot(message: discord.Message) -> bool:
     replies_to_bot = False
     if message.reference and message.reference.message_id:
         replies_to_bot = message.reference.message_id in recent_bot_messages
         if message.reference.resolved and hasattr(message.reference.resolved, "author"):
             replies_to_bot = replies_to_bot or message.reference.resolved.author.id == BOT_USER_ID
+    return replies_to_bot
+
+
+def access_decision(message: discord.Message) -> AccessDecision:
+    """套用 fail-closed allowlist 與 mention 規則。"""
+    replies_to_bot = replies_to_root_bot(message)
 
     return decide_access(
         CONFIG,
@@ -918,6 +923,7 @@ if SHARED_CORE_ENABLED:
     managed_config.setdefault("sharedDiscussion", {})["participants"] = [
         {
             "agentId": item.agent_id, "adapter": item.adapter,
+            "agentAlias": item.agent_alias,
             "mentionId": item.mention_id, "displayName": item.display_name,
             "budgetChars": item.budget_chars, "maxCalls": item.max_calls,
             "enabled": item.enabled, "available": item.available,
@@ -1244,6 +1250,34 @@ async def on_message(message: discord.Message):
                 return
             await safe_add_reaction(message, "⏳")
             try:
+                target_agent_id = None
+                effective_text = message.content or ""
+                mentions_root = any(user.id == BOT_USER_ID for user in message.mentions)
+                allow_without_mention = not mentions_root
+                if control is None:
+                    phase = shared_root.core.policy.state(room_id).phase
+                    if phase in {"active", "closing-check"}:
+                        stripped = shared_root.strip_ingress_mention(effective_text, BOT_USER_ID)
+                        if stripped is None and allow_without_mention:
+                            stripped = effective_text.strip()
+                        if not stripped:
+                            await message.channel.send("請先 mention 這個 Bot，且訊息內容不可為空。")
+                            await safe_add_reaction(message, "⚠️")
+                            return
+                        target_agent_id = shared_root.agent_id
+                        effective_text = stripped
+                    else:
+                        selected = shared_root.select_human_target(
+                            effective_text,
+                            BOT_USER_ID,
+                            allow_without_mention=allow_without_mention,
+                        )
+                        if not selected.accepted:
+                            await message.channel.send(selected.hint)
+                            await safe_add_reaction(message, "⚠️")
+                            return
+                        target_agent_id = selected.agent_id
+                        effective_text = selected.text
                 async with message.channel.typing():
                     result = await shared_root.handle(
                         allowed=True,
@@ -1251,8 +1285,9 @@ async def on_message(message: discord.Message):
                         room_id=room_id,
                         author_id=str(message.author.id),
                         display_name=message.author.display_name or message.author.name,
-                        text=message.content or "",
-                        mentions_agent=any(user.id == BOT_USER_ID for user in message.mentions),
+                        text=effective_text,
+                        mentions_agent=mentions_root or allow_without_mention,
+                        target_agent_id=target_agent_id,
                         timestamp=message.created_at.isoformat(),
                     )
             except Exception:

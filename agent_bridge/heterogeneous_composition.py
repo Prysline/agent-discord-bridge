@@ -89,4 +89,5 @@ def compose_existing_heterogeneous_root(
             display_names=display_names,
         ),
         primary_agent_id,
+        participants,
     )

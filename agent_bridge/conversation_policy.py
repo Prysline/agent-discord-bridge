@@ -27,6 +27,7 @@ FailureReason = Literal[
 ]
 
 MENTION_RE = re.compile(r"^<@!?(\d+)>[ \t]*")
+ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 @dataclass(frozen=True)
@@ -37,12 +38,16 @@ class Participant:
     max_calls: int
     enabled: bool = True
     available: bool = True
+    agent_alias: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_id or not self.mention_id:
             raise ValueError("participant identity must not be empty")
         if self.budget_chars < 1 or self.max_calls < 1:
             raise ValueError("participant quota must be positive")
+        alias = self.agent_alias or self.agent_id
+        if not ALIAS_RE.fullmatch(alias) or alias in {"discuss", "stop"}:
+            raise ValueError("participant alias is invalid")
 
 
 @dataclass
@@ -132,11 +137,23 @@ class ConversationPolicy:
         if global_max_dispatches < 1:
             raise ValueError("global_max_dispatches must be positive")
         by_agent = {item.agent_id: item for item in participants}
-        by_mention = {item.mention_id: item for item in participants}
-        if len(by_agent) != len(participants) or len(by_mention) != len(participants):
-            raise ValueError("participant agent_id and mention_id must be unique")
+        if len(by_agent) != len(participants):
+            raise ValueError("participant agent_id must be unique")
+        enabled_aliases = [item.agent_alias or item.agent_id for item in participants if item.enabled]
+        if len(set(enabled_aliases)) != len(enabled_aliases):
+            raise ValueError("enabled participant alias must be unique")
         self._participants = by_agent
-        self._mentions = by_mention
+        alias_groups: dict[str, list[Participant]] = {}
+        for item in participants:
+            alias_groups.setdefault(item.agent_alias or item.agent_id, []).append(item)
+        self._aliases = {
+            alias: next((item for item in values if item.enabled), values[0])
+            for alias, values in alias_groups.items()
+        }
+        mention_groups: dict[str, list[Participant]] = {}
+        for item in participants:
+            mention_groups.setdefault(item.mention_id, []).append(item)
+        self._mentions = {key: values[0] for key, values in mention_groups.items() if len(values) == 1}
         self.global_max_dispatches = global_max_dispatches
         self.start_command = start_command
         self.stop_command = stop_command
@@ -150,7 +167,7 @@ class ConversationPolicy:
     def _state(self, channel_id: str) -> DiscussionState:
         return self._states.setdefault(channel_id, DiscussionState())
 
-    def handle_event(self, event: Event) -> Transition:
+    def handle_event(self, event: Event, *, allow_control: bool = True) -> Transition:
         """Apply an authorized Discord event without dispatching a model."""
         state = self._state(event.channel_id)
         content = event.content.strip()
@@ -159,7 +176,7 @@ class ConversationPolicy:
             state.context_revision += 1
             return Transition(False, "context-observed", "peer output cannot schedule AI")
 
-        control = self.classify_control(content)
+        control = self.classify_control(content) if allow_control else None
         if control == "stop":
             return self._stop(state)
 
@@ -381,15 +398,17 @@ class ConversationPolicy:
         parsed = self._parse_start(content)
         if isinstance(parsed, str):
             return Transition(False, "rejected", parsed)
-        mention_ids, goal = parsed
-        if len(mention_ids) < 2:
+        selectors, goal = parsed
+        if len(selectors) < 2:
             return Transition(False, "rejected", "at least two participants required")
-        if len(set(mention_ids)) != len(mention_ids):
-            return Transition(False, "rejected", "duplicate participant")
 
         participants: list[Participant] = []
-        for mention_id in mention_ids:
-            participant = self._mentions.get(mention_id)
+        for selector in selectors:
+            mention = MENTION_RE.fullmatch(selector)
+            participant = (
+                self._mentions.get(mention.group(1))
+                if mention else self._aliases.get(selector)
+            )
             if participant is None:
                 return Transition(False, "rejected", "unknown participant")
             if not participant.enabled:
@@ -397,6 +416,8 @@ class ConversationPolicy:
             if not participant.available:
                 return Transition(False, "rejected", "unavailable participant")
             participants.append(participant)
+        if len({item.agent_id for item in participants}) != len(participants):
+            return Transition(False, "rejected", "duplicate participant")
 
         self._discussion_counter += 1
         state.phase = "active"
@@ -430,16 +451,15 @@ class ConversationPolicy:
             participant_text = first_line
             goal = remainder.strip() if separator else ""
 
-        mention_ids: list[str] = []
-        participant_text = participant_text.lstrip(" \t")
-        while match := MENTION_RE.match(participant_text):
-            mention_ids.append(match.group(1))
-            participant_text = participant_text[match.end() :]
-        if participant_text.strip():
-            return "participant header must contain only mentions"
+        selectors = participant_text.split()
+        if any(
+            not MENTION_RE.fullmatch(selector) and not ALIAS_RE.fullmatch(selector)
+            for selector in selectors
+        ):
+            return "participant header must contain only aliases"
         if not goal:
             return "goal must not be empty"
-        return mention_ids, goal
+        return selectors, goal
 
     def _stop(self, state: DiscussionState) -> Transition:
         state.phase = "stopped"

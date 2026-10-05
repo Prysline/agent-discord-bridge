@@ -44,9 +44,18 @@ loopback，使用同源檢查與 CSRF token，API 永不回傳 Bot Token。設�
 路由；多 Agent 共用 sender 時只在 Discord body 加顯示名稱，canonical content
 保持原文。額外 sender client 僅負責 outbound，不參與 ingress。
 
+Inbound identity 與 outbound sender 分離：Discord Bot mention 只辨識目前唯一的
+root ingress Bot，`agentAlias` 才選擇實際 Agent。只有一個啟用 Agent 時
+`@Bot message` 直接路由；多個啟用 Agent 時必須使用 `@Bot alias: message`。
+Selector 在 canonical ingress 前移除，缺少、重複或未知 Alias 一律 fail closed。
+`!discuss alias-a alias-b -- goal` 使用同一組 Alias；討論進行中的普通 human
+intervention 只加入共同 context，因此不要求 Alias，也不另開 human-turn。這一版
+仍只有一個 root ingress Bot，所以啟用 Alias 採全域唯一；尚未實作多 ingress Bot
+namespace 或 sender-based inbound routing。
+
 `agent_bridge/conversation_policy.py` 是 core-owned deterministic state machine：
 
-- `!discuss` 以 mention 順序固定 participants 與 round-robin；錯誤 participant 使整次 start 失敗。
+- `!discuss` 以 Alias 順序固定 participants 與 round-robin；舊版唯一 mention selector 仍可相容解析，錯誤 participant 使整次 start 失敗。
 - Peer Discord output 只成為 context，不觸發下一位 agent。
 - 普通 human intervention 不重排 round-robin；若正在 closing check，則取消 closing check 並恢復 active。
 - `complete` 進入 closing check；只要出現 `continue` 就回 active；其餘有效 participant 都完成最後確認後才 completed。

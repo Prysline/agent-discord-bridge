@@ -3,6 +3,7 @@
     {
       "agentId": "AGENT_A",
       "displayName": "Agent A",
+      "agentAlias": "agent-a",
       "adapter": "codex",
       "mentionId": "123456789012345678",
       "senderId": "shared-main",

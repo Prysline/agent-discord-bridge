@@ -50,6 +50,9 @@ def parse_root_discussion_settings(config: Mapping[str, Any]) -> RootDiscussionS
         display_name = _non_empty(
             entry.get("displayName", agent_id), f"participants[{index}].displayName"
         )
+        agent_alias = _non_empty(
+            entry.get("agentAlias", agent_id), f"participants[{index}].agentAlias"
+        )
         participants.append(
             Participant(
                 agent_id,
@@ -58,6 +61,7 @@ def parse_root_discussion_settings(config: Mapping[str, Any]) -> RootDiscussionS
                 _positive_int(entry.get("maxCalls"), f"participants[{index}].maxCalls"),
                 _boolean(entry.get("enabled", True), f"participants[{index}].enabled"),
                 _boolean(entry.get("available", True), f"participants[{index}].available"),
+                agent_alias,
             )
         )
         display_names[agent_id] = display_name
@@ -122,4 +126,4 @@ def compose_existing_codex_root(
         timeout_ms=timeout_ms,
         display_names=display_names,
     )
-    return RootSharedHumanTurn(core, agent_id)
+    return RootSharedHumanTurn(core, agent_id, participants)

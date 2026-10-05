@@ -81,6 +81,21 @@ Agent 的「啟用」是正式參與開關。內部 `available` 欄位保留給 
 Sender 仍被 Agent 引用時也不能移除。移除只更新管理清單，不會修改 Binding；
 移除 Sender 也不會影響既有 AI 對話。
 
+`Agent Alias` 是人在共用 ingress Bot 後選擇 Agent 的穩定名稱，只能使用小寫
+英文字母開頭，後接小寫字母、數字、`_` 或 `-`，最多 32 字元；啟用中的 Alias
+必須唯一。只有一個啟用 Agent 時仍可直接使用 `@Bot 訊息`。同一個 ingress Bot
+有多個啟用 Agent 時，使用 `@Bot planner: 訊息`；bounded discussion 則使用
+`!discuss planner coder -- 討論目標`。缺少或無法辨識 Alias 時會拒絕執行，不會
+猜測或呼叫模型。Selector 只負責 ingress routing，不會寫進 canonical human
+content；Discord 回覆前綴仍使用顯示名稱。回覆 Bot 訊息時可省略再次 mention；
+共用 Bot 仍須以 `planner: 訊息` 指定 Agent。
+
+「討論字元額度」是單場 bounded discussion 中該 Agent 已確認送達 Discord 的
+完整 Unicode 字元數；某次合法回覆可超過剩餘額度，但會阻止下一次排程。「討論
+呼叫上限」是該 Agent 在同一場討論可啟動的模型呼叫數。兩者都不套用於一般
+human-turn。Binding 欄位分別顯示穩定 logical `bindingId`、目前 generation，及
+該版本是否存在可用的既有 AI 對話 mapping；前台不會建立或更換它們。
+
 若沒有 `agent-management.local.json`，既有 `config.json` participants 與
 `DISCORD_TOKEN` / `BOT_USER_ID` 會組成相容的 `legacy-default` sender。多個啟用
 Agent 共用同一 Sender 時，Discord 顯示會自動加上 `<displayName>: `；專屬
