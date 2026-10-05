@@ -71,8 +71,15 @@ python -m agent_bridge.admin_ui
 
 前台只監聽 `127.0.0.1:8766`，可編輯 Agent、adapter、討論額度與
 Discord Sender。既有 Agent ID 為唯讀；Binding 只顯示狀態，不提供 create、
-rebind、retire 或 generation mutation。Token 只會顯示「已設定」，留白表示保留
-原值。儲存採完整驗證後的單檔 atomic replace，並於重新啟動 Bot 後生效。
+rebind、retire 或 generation mutation。Token 只會顯示「已設定」；只有 Sender ID
+未變且 Token 已設定時，留白才會保留原值，新增或更名的 Sender 必須輸入 Token。
+儲存採完整驗證後的單檔 atomic replace，並於重新啟動 Bot 後生效。可用
+`127.0.0.1` 或 `localhost` 開啟；關閉前台請回到終端機按 `Ctrl+C`。
+
+Agent 的「啟用」是正式參與開關。內部 `available` 欄位保留給 runtime 狀態，
+不由管理前台手動編輯。有 Binding 的 Agent 只能停用，不能從管理設定移除。
+Sender 仍被 Agent 引用時也不能移除。移除只更新管理清單，不會修改 Binding；
+移除 Sender 也不會影響既有 AI 對話。
 
 若沒有 `agent-management.local.json`，既有 `config.json` participants 與
 `DISCORD_TOKEN` / `BOT_USER_ID` 會組成相容的 `legacy-default` sender。多個啟用

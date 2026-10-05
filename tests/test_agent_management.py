@@ -12,6 +12,7 @@ from agent_bridge.agent_management import (
     load_agent_management, merge_secret_placeholders, parse_agent_management,
     save_agent_management,
     validate_binding_associations,
+    validate_removals,
 )
 from agent_bridge.discord_delivery import DiscordSenderDelivery
 
@@ -116,6 +117,20 @@ class AgentManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"native mapping"):
             validate_binding_associations(value,raw)
 
+    def test_bound_agent_removal_is_rejected_but_unbound_removal_is_allowed(self):
+        current=parse_agent_management(valid_raw())
+        candidate=valid_raw(); candidate["agents"]=[candidate["agents"][1]]
+        removed=parse_agent_management(candidate)
+        bindings={"logicalBindings":[{"roomId":"one","agentId":"a","bindingId":"binding-a","activeGeneration":1}]}
+        with self.assertRaisesRegex(ValueError,"有 Binding"):
+            validate_removals(current,removed,bindings)
+        validate_removals(current,removed,{"logicalBindings":[]})
+
+    def test_sender_removal_requires_reassigning_agents(self):
+        candidate=valid_raw(); candidate["senders"]=[]
+        with self.assertRaisesRegex(ValueError,"找不到對應 Sender"):
+            parse_agent_management(candidate)
+
     def test_shared_and_dedicated_identity_routing(self):
         async def run():
             shared=parse_agent_management(valid_raw())
@@ -163,11 +178,18 @@ class AgentManagementTests(unittest.TestCase):
                 bad=request.Request(base+"/api/save",data=body,method="POST",headers={"Content-Type":"application/json"})
                 with self.assertRaises(error.HTTPError) as caught: request.urlopen(bad)
                 self.assertEqual(caught.exception.code,403)
+                self.assertIn("save-status",admin_ui.HTML)
+                self.assertIn("Sender ID 未變",admin_ui.HTML)
+                self.assertIn("catch(error)",admin_ui.HTML)
+                self.assertIn("removeAgent",admin_ui.HTML)
+                self.assertIn("removeSender",admin_ui.HTML)
+                self.assertNotIn('data-k="available"',admin_ui.HTML)
+                self.assertIn("white-space:nowrap",admin_ui.HTML)
                 state["agents"][0]["displayName"]="Updated Agent"
                 state["senders"][0]["token"]=""
                 saved=request.Request(
                     base+"/api/save",data=json.dumps(state).encode(),method="POST",
-                    headers={"Content-Type":"application/json","Origin":base,"X-CSRF-Token":server.csrf_token},
+                    headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token},
                 )
                 self.assertEqual(json.loads(request.urlopen(saved).read()),{"saved":True})
                 updated=load_agent_management(config,{},"",0)

@@ -232,6 +232,26 @@ def validate_binding_associations(value: AgentManagement, raw: Mapping[str, Any]
         raise ValueError("\n".join(errors))
 
 
+def validate_removals(
+    current: AgentManagement,
+    candidate: AgentManagement,
+    raw: Mapping[str, Any],
+) -> None:
+    remaining = {agent.agent_id for agent in candidate.agents}
+    removed = {agent.agent_id for agent in current.agents} - remaining
+    bound = {
+        str(entry.get("agentId"))
+        for entry in raw.get("logicalBindings", [])
+        if isinstance(entry, Mapping)
+    }
+    blocked = sorted(removed & bound)
+    if blocked:
+        raise ValueError(
+            "有 Binding 的 Agent 不可從管理設定移除；請先停用："
+            + ", ".join(blocked)
+        )
+
+
 def _text(value: Any, field: str, errors: list[str]) -> str:
     if not isinstance(value, str) or not value.strip():
         errors.append(f"{field}: 必填")
