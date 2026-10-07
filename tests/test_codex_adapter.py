@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from pathlib import Path
 
 from codex_adapter.app_server import (
     AppServerMethodUnsupported,
@@ -7,11 +8,14 @@ from codex_adapter.app_server import (
     AppServerRpcError,
     AppServerTransportError,
     CodexAppServerClient,
+    ThreadReference,
     TurnReference,
 )
+from codex_adapter.control_plane import CodexControlPlane, CodexCreateAmbiguous, CodexCreateRejected
 from codex_adapter.binding import (
     BindingGenerationMismatch,
     BindingUnavailable,
+    InMemoryBindingResolver,
     ResolvedBinding,
 )
 from codex_adapter.persistent import CodexPersistentAdapter
@@ -608,6 +612,8 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
                 result = {}
             elif method == "thread/resume":
                 result = {"thread": {"id": THREAD_ID}}
+            elif method == "thread/start":
+                result = {"thread": {"id": "new-thread"}}
             elif method == "turn/start":
                 result = {"turn": {"id": "turn-placeholder", "status": "inProgress"}}
             elif method == "thread/read":
@@ -624,6 +630,7 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
         client = CodexAppServerClient(lambda: transport)
         await client.connect()
         await client.resume_thread(THREAD_ID)
+        created = await client.start_thread(cwd=Path("workspace"), model="model", base_instructions="safe")
         await client.start_turn(THREAD_ID, "prompt", REQUEST_ID)
         await client.read_thread(THREAD_ID)
         await client.list_turns(THREAD_ID)
@@ -635,17 +642,73 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
             [
                 "initialize",
                 "thread/resume",
+                "thread/start",
                 "turn/start",
                 "thread/read",
                 "thread/turns/list",
                 "turn/interrupt",
             ],
         )
-        turn_start = calls[2][1]
+        self.assertEqual(created.thread_id, "new-thread")
+        thread_start = calls[2][1]
+        self.assertFalse(thread_start["ephemeral"])
+        self.assertEqual(thread_start["approvalPolicy"], "never")
+        turn_start = calls[3][1]
         self.assertEqual(turn_start["clientUserMessageId"], REQUEST_ID)
-        turns_list = calls[4][1]
+        turns_list = calls[5][1]
         self.assertEqual(turns_list["itemsView"], "full")
         await client.close()
+
+
+class FakeControlClient:
+    def __init__(self, create_outcome=None, resume_outcome=None):
+        self.create_outcome = create_outcome or ThreadReference("new-thread")
+        self.resume_outcome = resume_outcome
+        self.create_calls = 0
+        self.resume_calls = []
+
+    async def start_thread(self, **kwargs):
+        self.create_calls += 1
+        if isinstance(self.create_outcome, Exception):
+            raise self.create_outcome
+        return self.create_outcome
+
+    async def resume_thread(self, thread_id):
+        self.resume_calls.append(thread_id)
+        if isinstance(self.resume_outcome, Exception):
+            raise self.resume_outcome
+        return {"thread": {"id": thread_id}}
+
+
+class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
+    def control(self, client):
+        return CodexControlPlane(
+            client,
+            cwd=Path("workspace"),
+            model="model",
+            base_instructions="safe",
+            resolver=InMemoryBindingResolver([]),
+        )
+
+    async def test_validate_existing_uses_resume_without_model_turn(self):
+        client = FakeControlClient()
+        await self.control(client).validate_existing("existing-thread")
+        self.assertEqual(client.resume_calls, ["existing-thread"])
+        self.assertEqual(client.create_calls, 0)
+
+    async def test_confirmed_create_returns_native_reference_once(self):
+        client = FakeControlClient()
+        self.assertEqual(await self.control(client).create(), "new-thread")
+        self.assertEqual(client.create_calls, 1)
+
+    async def test_explicit_rejection_and_ambiguous_transport_are_distinct(self):
+        rejected = FakeControlClient(AppServerRpcError(-1, "rejected"))
+        with self.assertRaises(CodexCreateRejected):
+            await self.control(rejected).create()
+        ambiguous = FakeControlClient(AppServerTransportError("lost", ambiguous=True))
+        with self.assertRaises(CodexCreateAmbiguous):
+            await self.control(ambiguous).create()
+        self.assertEqual(ambiguous.create_calls, 1)
 
     async def test_completion_notification_is_fast_path(self):
         def responder(payload):

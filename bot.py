@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ import websockets
 from dotenv import load_dotenv
 
 from agent_bridge.agent_management import load_agent_management
+from agent_bridge.admin_ui import create_server as create_admin_server
+from agent_bridge.binding_operations import BindingAdminControl, BindingOperations
 from agent_bridge.discord_delivery import DiscordSenderDelivery
 from agent_bridge.heterogeneous_composition import compose_existing_heterogeneous_root
 from agent_bridge.root_shared import safe_failure_message
@@ -29,6 +32,7 @@ from codex_adapter.app_server import (
     CodexAppServerClient as SharedCodexAppServerClient,
     StdioTransport as SharedStdioTransport,
 )
+from codex_adapter.control_plane import CodexControlPlane
 from codex_adapter.root_composition import parse_root_discussion_settings
 
 from conversation_policy import (
@@ -71,6 +75,7 @@ AGENT_MANAGEMENT_PATH = (
     AGENT_MANAGEMENT_PATH_RAW if AGENT_MANAGEMENT_PATH_RAW.is_absolute()
     else BOT_DIR / AGENT_MANAGEMENT_PATH_RAW
 ).resolve()
+AGENT_ADMIN_PORT = int(os.getenv("AGENT_ADMIN_PORT", "8766") or "8766")
 ANTIGRAVITY_RENDEZVOUS_PATH_RAW = Path(
     os.getenv("ANTIGRAVITY_RENDEZVOUS_PATH", "antigravity-sidecar.runtime.json")
 )
@@ -909,6 +914,8 @@ codex_client = CodexAppServerClient(
 shared_delivery: DiscordSenderDelivery | None = None
 shared_app_client: SharedCodexAppServerClient | None = None
 shared_root = None
+shared_admin_server = None
+shared_admin_thread: threading.Thread | None = None
 if SHARED_CORE_ENABLED:
     if not SHARED_AGENT_ID:
         raise RuntimeError("SHARED_AGENT_ID is required when shared core is enabled")
@@ -1189,6 +1196,7 @@ async def send_codex_reply(message: discord.Message, text: str | None) -> bool:
 
 @client.event
 async def on_ready():
+    global shared_admin_server, shared_admin_thread
     log.info(f"{BOT_DISPLAY_NAME} Listener Bot 已上線: {client.user} (ID: {client.user.id})")
     try:
         for sender in AGENT_MANAGEMENT.senders:
@@ -1205,6 +1213,37 @@ async def on_ready():
         if SHARED_CORE_ENABLED:
             assert shared_app_client is not None
             await shared_app_client.connect()
+            if shared_admin_server is None:
+                assert shared_root is not None
+                native_controls = {}
+                for agent_id, adapter_type in shared_discussion.adapter_types.items():
+                    if adapter_type != "codex":
+                        continue
+                    adapter = shared_root.core.adapters[agent_id]
+                    native_controls[agent_id] = CodexControlPlane(
+                        shared_app_client,
+                        cwd=CODEX_CWD,
+                        model=CODEX_MODEL,
+                        base_instructions=PERSONA_INSTRUCTIONS,
+                        resolver=adapter.binding_resolver,
+                    )
+                admin = BindingAdminControl(
+                    BindingOperations(SHARED_BINDINGS_PATH, shared_root),
+                    adapter_types=shared_discussion.adapter_types,
+                    display_names=shared_discussion.display_names,
+                    native_controls=native_controls,
+                )
+                shared_admin_server = create_admin_server(
+                    AGENT_MANAGEMENT_PATH, SHARED_BINDINGS_PATH, CONFIG,
+                    TOKEN or "", BOT_USER_ID, AGENT_ADMIN_PORT,
+                    binding_admin=admin, event_loop=asyncio.get_running_loop(),
+                )
+                shared_admin_thread = threading.Thread(
+                    target=shared_admin_server.serve_forever,
+                    name="agent-admin-ui", daemon=True,
+                )
+                shared_admin_thread.start()
+                log.info(f"Agent 管理前台：http://127.0.0.1:{shared_admin_server.server_port}")
         else:
             await codex_client.ensure_started()
     except Exception as exc:
@@ -1305,6 +1344,19 @@ async def on_message(message: discord.Message):
                 return
             if result is not None and result.action == "discussion-context":
                 await safe_add_reaction(message, "✅")
+                return
+            if result is not None and result.action == "onboarding-required":
+                await message.channel.send(
+                    "這個 Agent 在此頻道還沒有設定聊天窗。\n"
+                    "請到本機 Agent 管理前台建立新聊天窗或綁定既有聊天窗。"
+                )
+                await safe_add_reaction(message, "⚠️")
+                return
+            if result is not None and result.action == "onboarding-pending":
+                await message.channel.send(
+                    "這個 Agent 正在等待完成聊天窗綁定。請先到本機管理前台完成設定。"
+                )
+                await safe_add_reaction(message, "⚠️")
                 return
             if result is not None and result.action == "rejected":
                 await message.channel.send("討論指令無效，或目前已有討論正在進行。")

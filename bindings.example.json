@@ -1,17 +1,27 @@
 {
-  "logicalBindings": [
+  "bindingLineages": [
+    {
+      "agentId": "AGENT_A",
+      "bindingId": "BINDING_A",
+      "generations": [7]
+    },
+    {
+      "agentId": "AGENT_B",
+      "bindingId": "BINDING_B",
+      "generations": [3]
+    }
+  ],
+  "activeBindings": [
     {
       "roomId": "ROOM_PLACEHOLDER",
       "agentId": "AGENT_A",
       "bindingId": "BINDING_A",
-      "generations": [7],
       "activeGeneration": 7
     },
     {
       "roomId": "ROOM_PLACEHOLDER",
       "agentId": "AGENT_B",
       "bindingId": "BINDING_B",
-      "generations": [3],
       "activeGeneration": 3
     }
   ],

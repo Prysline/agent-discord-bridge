@@ -52,11 +52,11 @@ Copy-Item bindings.example.json bindings.local.json
 python -m pip install -r requirements.txt
 ```
 
-`bindings.local.json` 只載入人類事先建立的 existing binding；shared state 僅保留 logical identity，Codex thread ID／Antigravity conversation ID 只存在各自 adapter-local resolver。設定矛盾會 fail closed，不會建立或替換 native session。真實 Token、numeric ID、native session ID 與 persona 不得提交。
+`bindings.local.json` 保存 stable logical lineage、目前 room association 與 adapter-local native mapping；shared state 不持有 Codex thread ID／Antigravity conversation ID。設定矛盾會 fail closed。真實 Token、numeric ID、native session ID 與 persona 不得提交。
 
 Antigravity Sidecar 的追蹤範例位於 `antigravity_adapter/sidecar/sidecar.example.json`；安裝時須把 rendezvous 與 transcript root placeholders 換成本機設定。transcript root 必須明確指向包含各 conversation subtree 的 Antigravity brain root；worker 不猜 home、使用者名稱或私人路徑。`agentapi send-message` 負責 dispatch，`/result` 以 dispatch 前 byte offset、file identity、唯一 request marker 與 bounded JSONL delta 恢復 final；Stop hook 可用相同 extractor 提前完成，但只是 optional fast path。worker 只監聽 `127.0.0.1`，每次啟動輪替 bearer token 與 instance identity，並從 Antigravity 注入的 PATH discovery `agentapi`；不支援的 wrapper 會拒絕啟動，不會退回 CDP 或猜測安裝路徑。Windows runtime 另以 opaque named mutex、exclusive loopback socket 與經 creation-time驗證的 parent process handle保護單一 instance；parent watcher以 owned cancellation event安全退出，parent結束時 worker自行 shutdown。Rendezvous以 Windows atomic no-replace primitive發布；既有 live、stale 或無法判定 ownership 的 artifact一律 fail closed，worker不會覆寫它，也不會掃描或終止未知 process。
 
-設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 使用 bootstrap existing binding 與 shared canonical event-delta；此模式不讀 Discord recent history、不建立 native session，也不在失敗時 fallback legacy execution。`config.json` 的 participant 以 `adapter: codex|antigravity` 選擇 composition；Antigravity 另需把 `ANTIGRAVITY_RENDEZVOUS_PATH` 指向 Sidecar 每次啟動 atomic 發布的 gitignored runtime file。`!stop` 仍只走 shared invalidation；Antigravity 目前準確宣告 `canCancelInFlight=false`，late result 不能越過 core token。cross-adapter 真人 E2E 已完成；chunking 與 durable persistence尚未完成。
+設定 `SHARED_CORE_ENABLED=true` 與明確的 `SHARED_AGENT_ID` 後，root bot 的 authorized human-turn 使用 shared canonical event-delta；缺少 binding 時保留第一則訊息並進入 onboarding，不呼叫模型，也不 fallback legacy execution。`config.json` 的 participant 以 `adapter: codex|antigravity` 選擇 composition；Antigravity 另需把 `ANTIGRAVITY_RENDEZVOUS_PATH` 指向 Sidecar 每次啟動 atomic 發布的 gitignored runtime file。`!stop` 仍只走 shared invalidation；Antigravity 目前準確宣告 `canCancelInFlight=false`，late result 不能越過 core token。cross-adapter 真人 E2E 已完成；onboarding control plane 尚未做真人 E2E，chunking 與 durable persistence尚未完成。
 
 ## 驗證
 
@@ -70,8 +70,10 @@ python -m agent_bridge.admin_ui
 ```
 
 前台只監聽 `127.0.0.1:8766`，可編輯 Agent、adapter、討論額度與
-Discord Sender。既有 Agent ID 為唯讀；Binding 只顯示狀態，不提供 create、
-rebind、retire 或 generation mutation。Token 只會顯示「已設定」；只有 Sender ID
+Discord Sender。既有 Agent ID 為唯讀。當前 Bot 內嵌前台可處理待完成 onboarding：
+重新連結已管理的 detached Binding、驗證並綁定既有 Codex thread，或在明確確認後
+建立 Codex thread；Antigravity 尚未開放 native create／bind-existing。它也可搬移或
+解除 room association，但不提供 rebind、retire 或 generation mutation。Token 只會顯示「已設定」；只有 Sender ID
 未變且 Token 已設定時，留白才會保留原值，新增或更名的 Sender 必須輸入 Token。
 儲存採完整驗證後的單檔 atomic replace，並於重新啟動 Bot 後生效。可用
 `127.0.0.1` 或 `localhost` 開啟；關閉前台請回到終端機按 `Ctrl+C`。
@@ -94,7 +96,10 @@ content；Discord 回覆前綴仍使用顯示名稱。回覆 Bot 訊息時可省
 完整 Unicode 字元數；某次合法回覆可超過剩餘額度，但會阻止下一次排程。「討論
 呼叫上限」是該 Agent 在同一場討論可啟動的模型呼叫數。兩者都不套用於一般
 human-turn。Binding 欄位分別顯示穩定 logical `bindingId`、目前 generation，及
-該版本是否存在可用的既有 AI 對話 mapping；前台不會建立或更換它們。
+該版本是否存在可用的既有 AI 對話 mapping。搬移與解除綁定都保留 logical lineage
+與 native session；建立／綁定只有 persistence 成功後才發布到 runtime。Codex 建立
+結果不明時不會自動重試；若 native thread 已建立但本機保存失敗，前台會要求先到
+Codex 檢查，再以「綁定既有聊天窗」納管。
 
 若沒有 `agent-management.local.json`，既有 `config.json` participants 與
 `DISCORD_TOKEN` / `BOT_USER_ID` 會組成相容的 `legacy-default` sender。多個啟用

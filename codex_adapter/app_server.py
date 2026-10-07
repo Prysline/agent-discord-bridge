@@ -188,6 +188,11 @@ class TurnReference:
     status: str
 
 
+@dataclass(frozen=True)
+class ThreadReference:
+    thread_id: str
+
+
 class CodexAppServerClient:
     """Typed subset of app-server methods required by the persistent adapter."""
 
@@ -247,6 +252,26 @@ class CodexAppServerClient:
         if thread.get("id") != thread_id:
             raise AppServerProtocolError("thread/resume returned a different thread")
         return result
+
+    async def start_thread(
+        self, *, cwd: Path, model: str, base_instructions: str
+    ) -> ThreadReference:
+        result = await self._request(
+            "thread/start",
+            {
+                "cwd": str(cwd),
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "model": model,
+                "ephemeral": False,
+                "baseInstructions": base_instructions,
+            },
+        )
+        thread = _require_object(result.get("thread"), "thread/start.thread")
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise AppServerProtocolError("thread/start returned a malformed thread")
+        return ThreadReference(thread_id)
 
     async def start_turn(
         self,

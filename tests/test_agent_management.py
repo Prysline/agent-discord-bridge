@@ -50,6 +50,15 @@ class FakeClient:
         return self.channel
 
 
+class FakeBindingAdmin:
+    def __init__(self): self.calls=[]
+    def state(self):
+        return {"pendingOnboarding":[{"roomId":"room","agentId":"a","agentDisplayName":"A","adapter":"codex","createdAt":"now","status":"pending","triggerPreview":"hello","canCreate":True,"canBindExisting":True}],"bindings":[]}
+    async def cancel_pending(self, room_id, agent_id): self.calls.append(("cancel",room_id,agent_id)); return True
+    async def bind_existing(self, room_id, agent_id, native_reference): self.calls.append(("bind-existing",room_id,agent_id,native_reference))
+    async def create_pending(self, room_id, agent_id): self.calls.append(("create",room_id,agent_id))
+
+
 class AgentManagementTests(unittest.TestCase):
     def test_valid_config_and_redaction(self):
         value=parse_agent_management(valid_raw())
@@ -131,6 +140,18 @@ class AgentManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"native mapping"):
             validate_binding_associations(value,raw)
 
+    def test_current_binding_schema_is_validated(self):
+        value=parse_agent_management(valid_raw())
+        raw={
+            "bindingLineages":[{"agentId":"a","bindingId":"binding-a","generations":[3]}],
+            "activeBindings":[{"roomId":"one","agentId":"a","bindingId":"binding-a","activeGeneration":3}],
+            "codexBindings":[{"bindingId":"binding-a","generation":3}],
+        }
+        validate_binding_associations(value,raw)
+        changed=valid_raw();changed["agents"][0]["adapter"]="antigravity"
+        with self.assertRaisesRegex(ValueError,"native mapping"):
+            validate_binding_associations(parse_agent_management(changed),raw)
+
     def test_bound_agent_removal_is_rejected_but_unbound_removal_is_allowed(self):
         current=parse_agent_management(valid_raw())
         candidate=valid_raw(); candidate["agents"]=[candidate["agents"][1]]
@@ -139,6 +160,14 @@ class AgentManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"有 Binding"):
             validate_removals(current,removed,bindings)
         validate_removals(current,removed,{"logicalBindings":[]})
+
+    def test_detached_lineage_still_blocks_agent_removal(self):
+        current=parse_agent_management(valid_raw())
+        candidate=valid_raw(); candidate["agents"]=[candidate["agents"][1]]
+        removed=parse_agent_management(candidate)
+        bindings={"bindingLineages":[{"agentId":"a","bindingId":"binding-a","generations":[1]}],"activeBindings":[]}
+        with self.assertRaisesRegex(ValueError,"有 Binding"):
+            validate_removals(current,removed,bindings)
 
     def test_sender_removal_requires_reassigning_agents(self):
         candidate=valid_raw(); candidate["senders"]=[]
@@ -215,6 +244,33 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertNotIn("rebind",admin_ui.HTML.lower());self.assertNotIn("retire",admin_ui.HTML.lower())
             finally:
                 server.shutdown();server.server_close();thread.join(2)
+
+    def test_admin_binding_action_requires_runtime_and_uses_bot_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); config=root/"agent-management.local.json"; save_agent_management(config,parse_agent_management(valid_raw()))
+            loop=asyncio.new_event_loop(); loop_thread=threading.Thread(target=loop.run_forever,daemon=True);loop_thread.start()
+            admin=FakeBindingAdmin()
+            server=admin_ui.create_server(config,root/"missing-bindings.json",{},"",0,0,binding_admin=admin,event_loop=loop)
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start();base=f"http://127.0.0.1:{server.server_port}"
+            try:
+                state=json.loads(request.urlopen(base+"/api/state").read())
+                self.assertEqual(state["bindingControl"]["pendingOnboarding"][0]["roomId"],"room")
+                body=json.dumps({"roomId":"room","agentId":"a"}).encode()
+                req=request.Request(base+"/api/bindings/cancel",data=body,method="POST",headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token})
+                self.assertEqual(json.loads(request.urlopen(req).read()),{"ok":True})
+                for path, payload in [
+                    ("bind-existing", {"roomId":"room","agentId":"a","nativeReference":"existing"}),
+                    ("create", {"roomId":"room","agentId":"a"}),
+                ]:
+                    req=request.Request(base+f"/api/bindings/{path}",data=json.dumps(payload).encode(),method="POST",headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token})
+                    self.assertEqual(json.loads(request.urlopen(req).read()),{"ok":True})
+                self.assertEqual(admin.calls,[
+                    ("cancel","room","a"),
+                    ("bind-existing","room","a","existing"),
+                    ("create","room","a"),
+                ])
+            finally:
+                server.shutdown();server.server_close();thread.join(2);loop.call_soon_threadsafe(loop.stop);loop_thread.join(2);loop.close()
 
 
 if __name__ == "__main__": unittest.main()

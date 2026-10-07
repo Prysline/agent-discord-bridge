@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import re
 
 from .conversation_policy import Participant
@@ -23,6 +24,14 @@ class HumanTarget:
     hint: str = ""
 
 
+@dataclass(frozen=True)
+class OnboardingPending:
+    room_id: str
+    agent_id: str
+    created_at: str
+    trigger_preview: str
+
+
 class RootSharedHumanTurn:
     def __init__(self, core: SharedOrchestrator, agent_id: str, participants: list[Participant] | None = None) -> None:
         if not agent_id.strip():
@@ -33,6 +42,24 @@ class RootSharedHumanTurn:
             self._enabled = [Participant(agent_id, "legacy", 1, 1, agent_alias=agent_id)]
         else:
             self._enabled = [item for item in participants if item.enabled]
+        self._onboarding: dict[tuple[str, str], OnboardingPending] = {}
+
+    def pending_onboarding(self) -> tuple[OnboardingPending, ...]:
+        return tuple(self._onboarding.values())
+
+    def cancel_onboarding(self, room_id: str, agent_id: str) -> bool:
+        return self._onboarding.pop((room_id, agent_id), None) is not None
+
+    async def complete_onboarding(
+        self, room_id: str, agent_id: str, binding: "BindingSnapshot"
+    ) -> RootHumanTurnResult:
+        key = (room_id, agent_id)
+        if key not in self._onboarding:
+            return RootHumanTurnResult("ignored")
+        self.core.publish_binding(room_id, agent_id, binding)
+        self._onboarding.pop(key)
+        outcomes = await self.core.run_human_turn(room_id, (agent_id,))
+        return RootHumanTurnResult("handled", tuple(outcomes))
 
     def select_human_target(
         self, text: str, bot_user_id: int, *, allow_without_mention: bool = False
@@ -97,6 +124,26 @@ class RootSharedHumanTurn:
             return RootHumanTurnResult(outcome.action, (outcome,))
 
         selected_agent = target_agent_id or self.agent_id
+        key = (room_id, selected_agent)
+        if self.core.binding(room_id, selected_agent) is None:
+            if key in self._onboarding:
+                return RootHumanTurnResult("onboarding-pending")
+            outcome = self.core.ingest_human(
+                room_id,
+                author_id=author_id,
+                display_name=display_name,
+                text=text,
+                mentioned_agents=(selected_agent,) if mentions_agent else (),
+                timestamp=timestamp,
+                allow_control=False,
+            )
+            self._onboarding[key] = OnboardingPending(
+                room_id,
+                selected_agent,
+                datetime.now(timezone.utc).isoformat(),
+                text[:160],
+            )
+            return RootHumanTurnResult("onboarding-required", (outcome,))
         outcome = self.core.ingest_human(
             room_id,
             author_id=author_id,

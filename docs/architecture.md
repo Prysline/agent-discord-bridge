@@ -32,7 +32,7 @@ Discord ingress
 
 `agent_bridge/contracts.py` 是 wiring 使用的 shared request／result validator；`codex_adapter/contracts.py` 保留 Codex result helpers，但重用同一份 shared AgentRequest validation，避免 schema 漂移。
 
-這些元件尚未持久化。Root Discord entry 已有 opt-in human-turn 與 bounded-discussion driver；driver 只反覆呼叫 shared core 選出的合法 turn，並讓 `!stop` 在 in-flight request 期間進入既有 stop／reconciliation lifecycle。Participant、quota 與 exact existing binding 由本機設定提供，root 不另建 scheduler。Peer ingestion、durable restart 與完整 production cutover仍未接線；Codex + Antigravity bounded discussion 真人 Discord E2E 已完成。
+這些元件尚未持久化。Root Discord entry 已有 opt-in human-turn 與 bounded-discussion driver；driver 只反覆呼叫 shared core 選出的合法 turn，並讓 `!stop` 在 in-flight request 期間進入既有 stop／reconciliation lifecycle。Participant 與 quota 由本機設定提供，root 不另建 scheduler。缺少 binding 的 human-turn 會建立單一 onboarding pending，保留第一則 canonical input 並抑制 follow-up model dispatch。Peer ingestion、durable restart 與完整 production cutover仍未接線；Codex + Antigravity bounded discussion 真人 Discord E2E 已完成，但 onboarding control plane 尚未做真人 E2E。
 
 ## Shared conversation policy
 
@@ -53,6 +53,22 @@ intervention 只加入共同 context，因此不要求 Alias，也不另開 huma
 仍只有一個 root ingress Bot，所以啟用 Alias 採全域唯一；尚未實作多 ingress Bot
 namespace 或 sender-based inbound routing。
 
+### Binding onboarding control plane
+
+`bindingLineages` 保存不含 room 的 stable `bindingId + agentId + generations`；
+`activeBindings` 只保存目前 room association。搬移與解除 association 不改變 lineage、
+generation 或 native mapping。所有管理 mutation 由 Bot event loop 上的單一
+`BindingAdminControl` lock 序列化，先 atomic replace `bindings.local.json`，再發布到
+in-memory resolver 並恢復原始 human-turn 一次。
+
+Codex control plane 只用已驗證的 `thread/resume` 驗證 existing thread，並以
+`thread/start` 明確建立 persistent thread。明確 rejection 不建立 mapping；transport
+或 response ambiguous 時不重試。native create 已成功但本機 persistence 失敗時，
+不刪除 native thread、不發布 runtime mapping，pending 保留並要求人類檢查後使用
+bind-existing。Antigravity 的 create／bind-existing 仍停用，因為尚無凍結且已驗證的
+control-plane contract。此階段是單 process、本機 JSON persistence；沒有 CAS、
+multiprocess coordination、retire 或 generation advancement。
+
 `agent_bridge/conversation_policy.py` 是 core-owned deterministic state machine：
 
 - `!discuss` 以 Alias 順序固定 participants 與 round-robin；舊版唯一 mention selector 仍可相容解析，錯誤 participant 使整次 start 失敗。
@@ -71,7 +87,7 @@ namespace 或 sender-based inbound routing。
 1. 以已提交且完成 Phase 1.5 驗證的 Codex 程式建立乾淨基線。
 2. 為 shared conversation policy 補上 frozen contract state machine 與回歸測試。（已完成）
 3. 建立 canonical log、event-delta cursor、shared contracts 與 orchestrator wiring target。（已完成 memory-only core）
-4. 以本機 existing-binding bootstrap 提供 exact logical/native mapping，將 Codex Discord human-turn 與 bounded-discussion root 入口接至 shared core；完整 create／rebind operations 仍留待後續 control-plane slice。（本機 wiring 與 bounded discussion Manual E2E 已完成）
+4. 以本機 binding bootstrap 提供 exact logical/native mapping，將 Codex Discord human-turn 與 bounded-discussion root 入口接至 shared core；再加入缺 binding onboarding、Codex create／bind-existing 與 room move／unbind。（本機實作與自動測試完成；onboarding Manual E2E 未執行）
 5. 以既有 probe evidence 建立 Antigravity exact binding、authenticated Sidecar transport、bounded transcript result recovery 與 persistent adapter，並在 composition layer 依 participant 選擇 runtime。（已完成本機實作、automated integration 與真人 cross-adapter E2E）
 6. 兩個 adapter 均通過共用 contract tests 後，才處理舊 fork 的退場或薄化。（contract regression 已接入 full suite；舊 fork 尚未退場）
 
@@ -91,6 +107,6 @@ Windows Sidecar lifecycle 使用三道獨立防線：由 canonical rendezvous pa
 
 - Discord production deployment。
 - Private Lane 或 stateless session。
-- binding create／rebind control plane。
+- Antigravity binding create／bind-existing、binding rebind／retire／generation advancement。
 - runtime DB 選型。
 - Claude Code adapter。

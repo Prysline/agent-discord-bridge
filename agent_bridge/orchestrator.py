@@ -242,6 +242,56 @@ class SharedOrchestrator:
             value.uncertain,
         )
 
+    def binding(self, room_id: str, agent_id: str) -> BindingSnapshot | None:
+        return self.bindings.get((room_id, agent_id))
+
+    def publish_binding(
+        self, room_id: str, agent_id: str, binding: BindingSnapshot
+    ) -> None:
+        key = (room_id, agent_id)
+        if key in self.bindings:
+            raise ValueError("room+agent already has an active binding")
+        if any(value.binding_id == binding.binding_id for value in self.bindings.values()):
+            raise ValueError("binding is already active in another room")
+        self.bindings[key] = binding
+
+    def detach_binding(self, room_id: str, agent_id: str) -> BindingSnapshot:
+        key = (room_id, agent_id)
+        self.require_binding_idle(room_id, agent_id)
+        try:
+            return self.bindings.pop(key)
+        except KeyError as exc:
+            raise ValueError("room+agent has no active binding") from exc
+
+    def move_binding(
+        self, source_room_id: str, target_room_id: str, agent_id: str
+    ) -> BindingSnapshot:
+        source = (source_room_id, agent_id)
+        target = (target_room_id, agent_id)
+        if target in self.bindings:
+            raise ValueError("target room+agent already has an active binding")
+        self.require_binding_idle(source_room_id, agent_id)
+        try:
+            binding = self.bindings.pop(source)
+        except KeyError as exc:
+            raise ValueError("source room+agent has no active binding") from exc
+        self.bindings[target] = binding
+        return binding
+
+    def require_binding_idle(self, room_id: str, agent_id: str) -> None:
+        if self._room_is_busy(room_id, agent_id):
+            raise ValueError("binding has active work or an unresolved fence")
+
+    def _room_is_busy(self, room_id: str, agent_id: str) -> bool:
+        state = self.policy.state(room_id)
+        cursor = self._cursors.get((room_id, agent_id))
+        return (
+            state.phase in {"active", "closing-check"}
+            or (room_id, agent_id) in self._pending_delivery
+            or (cursor is not None and (cursor.pending_request_id is not None or cursor.uncertain))
+            or any(key[0] == room_id for key in self._discussion_requests.values())
+        )
+
     def ingest_human(
         self,
         room_id: str,

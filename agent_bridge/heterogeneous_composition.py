@@ -38,10 +38,7 @@ def compose_existing_heterogeneous_root(
         raise ValueError("every discussion participant must select an adapter")
     selected_adapters.setdefault(primary_agent_id, "codex")
     codex_agents = {agent_id for agent_id, kind in selected_adapters.items() if kind == "codex"}
-    codex_raw = dict(raw)
-    codex_raw["logicalBindings"] = [
-        entry for entry in raw.get("logicalBindings", []) if entry.get("agentId") in codex_agents
-    ]
+    codex_raw = _select_adapter_bindings(raw, codex_agents, "codexBindings")
     codex = bootstrap_codex(codex_raw) if codex_agents else None
     antigravity_agents = {
         agent_id for agent_id, kind in selected_adapters.items() if kind == "antigravity"
@@ -66,8 +63,6 @@ def compose_existing_heterogeneous_root(
         for key, ref in control.active_by_room_agent.items()
         if key[1] in configured
     }
-    if {key[1] for key in bindings} != configured:
-        raise ValueError("configured shared agent has no active binding")
     antigravity_pairs = {
         (entry.get("bindingId"), entry.get("generation"))
         for entry in raw.get("antigravityBindings", [])
@@ -91,3 +86,37 @@ def compose_existing_heterogeneous_root(
         primary_agent_id,
         participants,
     )
+
+
+def _select_adapter_bindings(
+    raw: Mapping[str, object], agent_ids: set[str], native_field: str
+) -> dict[str, object]:
+    """Keep one adapter's logical lineages, associations, and native mappings."""
+    selected = dict(raw)
+    if "bindingLineages" in raw:
+        lineages = [
+            entry
+            for entry in raw.get("bindingLineages", [])
+            if isinstance(entry, Mapping) and entry.get("agentId") in agent_ids
+        ]
+        binding_ids = {entry.get("bindingId") for entry in lineages}
+        selected["bindingLineages"] = lineages
+        selected["activeBindings"] = [
+            entry
+            for entry in raw.get("activeBindings", [])
+            if isinstance(entry, Mapping) and entry.get("bindingId") in binding_ids
+        ]
+    else:
+        logical = [
+            entry
+            for entry in raw.get("logicalBindings", [])
+            if isinstance(entry, Mapping) and entry.get("agentId") in agent_ids
+        ]
+        binding_ids = {entry.get("bindingId") for entry in logical}
+        selected["logicalBindings"] = logical
+    selected[native_field] = [
+        entry
+        for entry in raw.get(native_field, [])
+        if isinstance(entry, Mapping) and entry.get("bindingId") in binding_ids
+    ]
+    return selected

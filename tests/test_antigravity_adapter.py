@@ -128,6 +128,18 @@ class AntigravityAdapterTests(unittest.TestCase):
         with self.assertRaises(BindingGenerationMismatch): asyncio.run(resolver.resolve("binding-b", 9))
         with self.assertRaises(BindingUnavailable): asyncio.run(resolver.resolve("missing", 3))
 
+    def test_duplicate_native_conversation_across_logical_pairs_fails(self):
+        raw = bindings()
+        raw["logicalBindings"].append({
+            "roomId": "other-room", "agentId": "agent-c", "bindingId": "binding-c",
+            "generations": [1], "activeGeneration": 1,
+        })
+        raw["antigravityBindings"].append({
+            "bindingId": "binding-c", "generation": 1, "conversationId": "conversation",
+        })
+        with self.assertRaisesRegex(ValueError, "already managed"):
+            bootstrap_existing_bindings(raw)
+
     def test_human_and_bounded_requests_preserve_core_request_id(self):
         for mode in ("human-turn", "bounded-discussion"):
             transport = FakeTransport()
@@ -217,6 +229,27 @@ class AntigravityAdapterTests(unittest.TestCase):
 
 
 class HeterogeneousCompositionTests(unittest.TestCase):
+    def test_current_binding_schema_composes_both_adapters(self):
+        raw = {
+            "bindingLineages": [
+                {"agentId":"agent-a","bindingId":"binding-a","generations":[1]},
+                {"agentId":"agent-b","bindingId":"binding-b","generations":[3]},
+            ],
+            "activeBindings": [
+                {"roomId":"room","agentId":"agent-a","bindingId":"binding-a","activeGeneration":1},
+                {"roomId":"room","agentId":"agent-b","bindingId":"binding-b","activeGeneration":3},
+            ],
+            "codexBindings":[{"bindingId":"binding-a","generation":1,"threadId":"thread"}],
+            "antigravityBindings":[{"bindingId":"binding-b","generation":3,"conversationId":"conversation"}],
+        }
+        participants = [Participant("agent-a","101",100,1), Participant("agent-b","202",100,1)]
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"bindings.json"; path.write_text(json.dumps(raw), encoding="utf-8")
+            bridge=compose_existing_heterogeneous_root(binding_path=path, primary_agent_id="agent-a", adapter_types={"agent-a":"codex","agent-b":"antigravity"}, codex_client=object(), antigravity_transport=FakeTransport(), delivery=Delivery(), participants=participants, display_names={"agent-a":"A","agent-b":"B"}, global_max_dispatches=2)
+        self.assertIsInstance(bridge.core.adapters["agent-a"], CodexPersistentAdapter)
+        self.assertIsInstance(bridge.core.adapters["agent-b"], AntigravityPersistentAdapter)
+        self.assertEqual(set(bridge.core.bindings), {("room", "agent-a"), ("room", "agent-b")})
+
     def test_composition_selects_adapter_per_agent_without_native_ids_in_core(self):
         raw = {
             "logicalBindings": [
@@ -243,6 +276,42 @@ class HeterogeneousCompositionTests(unittest.TestCase):
             path=Path(directory)/"bindings.json"; path.write_text(json.dumps(raw), encoding="utf-8")
             bridge=compose_existing_heterogeneous_root(binding_path=path, primary_agent_id="agent-a", adapter_types={"agent-a":"codex"}, codex_client=object(), antigravity_transport=FakeTransport(), delivery=Delivery(), participants=[participant], display_names={"agent-a":"A"}, global_max_dispatches=1)
         self.assertEqual(bridge.core.adapters["agent-a"].__class__.__name__, "CodexPersistentAdapter")
+
+    def test_missing_binding_reaches_onboarding_without_model_invocation(self):
+        raw = {
+            "bindingLineages": [],
+            "activeBindings": [],
+            "codexBindings": [],
+            "antigravityBindings": [],
+        }
+        client = FakeCodexClient()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            bridge = compose_existing_heterogeneous_root(
+                binding_path=path,
+                primary_agent_id="agent-a",
+                adapter_types={"agent-a": "codex"},
+                codex_client=client,
+                antigravity_transport=FakeTransport(),
+                delivery=Delivery(),
+                participants=[Participant("agent-a", "101", 100, 1)],
+                display_names={"agent-a": "A"},
+                global_max_dispatches=1,
+            )
+            result = asyncio.run(bridge.handle(
+                allowed=True,
+                is_peer=False,
+                room_id="new-room",
+                author_id="human",
+                display_name="Human",
+                text="retain this first message",
+                mentions_agent=True,
+            ))
+        self.assertEqual(result.action, "onboarding-required")
+        self.assertEqual(len(bridge.pending_onboarding()), 1)
+        self.assertEqual(client.resume_calls, [])
+        self.assertEqual(client.start_calls, [])
 
     def test_human_turn_only_parser_defaults_primary_to_codex(self):
         raw = {

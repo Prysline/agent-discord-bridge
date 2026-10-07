@@ -29,7 +29,6 @@ class BindingGenerationRecord:
 @dataclass(frozen=True)
 class BindingLineage:
     binding_id: str
-    room_id: str
     agent_id: str
     generations: tuple[BindingGenerationRecord, ...]
 
@@ -72,6 +71,10 @@ class BindingControlState:
             self._validate_active_ref(key, ref)
             self._active_by_room_agent[key] = ref
 
+        active_bindings = [ref.binding_id for ref in self._active_by_room_agent.values()]
+        if len(active_bindings) != len(set(active_bindings)):
+            raise ValueError("binding may be active in only one room")
+
     def snapshot(self) -> BindingControlSnapshot:
         """Return detached state that callers may inspect or modify safely."""
         return BindingControlSnapshot(
@@ -79,12 +82,42 @@ class BindingControlState:
             bindings_by_id=deepcopy(self._bindings_by_id),
         )
 
+    def register_lineage(self, lineage: BindingLineage) -> None:
+        if lineage.binding_id in self._bindings_by_id:
+            raise ValueError("bindingId must identify exactly one lineage")
+        self._bindings_by_id[lineage.binding_id] = lineage
+
+    def attach(self, key: RoomAgentKey, ref: BindingRef) -> None:
+        if key in self._active_by_room_agent:
+            raise ValueError("room+agent may have only one active binding")
+        if any(value.binding_id == ref.binding_id for value in self._active_by_room_agent.values()):
+            raise ValueError("binding may be active in only one room")
+        self._validate_active_ref(key, ref)
+        self._active_by_room_agent[key] = ref
+
+    def detach(self, key: RoomAgentKey) -> BindingRef:
+        try:
+            return self._active_by_room_agent.pop(key)
+        except KeyError as exc:
+            raise ValueError("room+agent has no active binding") from exc
+
+    def move(self, source: RoomAgentKey, target: RoomAgentKey) -> BindingRef:
+        if target in self._active_by_room_agent:
+            raise ValueError("target room+agent already has an active binding")
+        ref = self._active_by_room_agent.get(source)
+        if ref is None:
+            raise ValueError("source room+agent has no active binding")
+        self._validate_active_ref(target, ref)
+        del self._active_by_room_agent[source]
+        self._active_by_room_agent[target] = ref
+        return ref
+
     def _validate_active_ref(self, key: RoomAgentKey, ref: BindingRef) -> None:
         lineage = self._bindings_by_id.get(ref.binding_id)
         if lineage is None:
             raise ValueError("active binding must reference an existing lineage")
-        if key != (lineage.room_id, lineage.agent_id):
-            raise ValueError("active binding owner must match room+agent")
+        if key[1] != lineage.agent_id:
+            raise ValueError("active binding agent must match lineage owner")
         if ref.generation not in {
             record.generation for record in lineage.generations
         }:

@@ -310,9 +310,25 @@ class RootSharedHumanTurnTests(unittest.TestCase):
     def test_missing_binding_fails_closed_without_adapter_execution(self):
         bridge, adapter, _ = runtime(bindings={})
         result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="hello", mentions_agent=True))
-        self.assertEqual(result.outcomes[0].action, "binding-unavailable")
+        self.assertEqual(result.action, "onboarding-required")
+        self.assertEqual(len(bridge.pending_onboarding()), 1)
         self.assertFalse(adapter.requests)
-        self.assertIn("既有對話綁定", safe_failure_message(result.outcomes))
+
+    def test_onboarding_suppresses_followups_and_resumes_original_once(self):
+        bridge, adapter, _ = runtime(bindings={})
+        first = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="first", mentions_agent=True))
+        second = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="second", mentions_agent=True))
+
+        self.assertEqual(first.action, "onboarding-required")
+        self.assertEqual(second.action, "onboarding-pending")
+        self.assertEqual([event.text for event in bridge.core.log.events("room-1")], ["first"])
+        self.assertFalse(adapter.requests)
+
+        completed = asyncio.run(bridge.complete_onboarding("room-1", "agent-a", BindingSnapshot("binding-a", 7)))
+        self.assertEqual(completed.action, "handled")
+        self.assertEqual(len(adapter.requests), 1)
+        self.assertEqual(adapter.requests[0]["context"]["events"][0]["text"], "first")
+        self.assertFalse(bridge.pending_onboarding())
 
     def test_unknown_delivery_keeps_orchestrator_fence(self):
         bridge, _, _ = runtime(delivery=FakeDelivery("unknown"))

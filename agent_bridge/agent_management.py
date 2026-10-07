@@ -226,7 +226,8 @@ def sender_usage(value: AgentManagement) -> dict[str, list[str]]:
 
 def validate_binding_associations(value: AgentManagement, raw: Mapping[str, Any]) -> None:
     logical: dict[str, list[tuple[Any, Any]]] = {}
-    for entry in raw.get("logicalBindings", []):
+    entries = raw.get("activeBindings", raw.get("logicalBindings", []))
+    for entry in entries:
         if isinstance(entry, Mapping):
             logical.setdefault(str(entry.get("agentId")), []).append(
                 (entry.get("bindingId"), entry.get("activeGeneration"))
@@ -251,9 +252,10 @@ def validate_removals(
 ) -> None:
     remaining = {agent.agent_id for agent in candidate.agents}
     removed = {agent.agent_id for agent in current.agents} - remaining
+    lineage_entries = raw.get("bindingLineages", raw.get("logicalBindings", []))
     bound = {
         str(entry.get("agentId"))
-        for entry in raw.get("logicalBindings", [])
+        for entry in lineage_entries
         if isinstance(entry, Mapping)
     }
     blocked = sorted(removed & bound)
