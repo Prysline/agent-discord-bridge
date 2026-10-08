@@ -10,6 +10,7 @@ from codex_adapter.app_server import (
     CodexAppServerClient,
     ThreadReference,
     TurnReference,
+    _safe_error_summary,
 )
 from codex_adapter.control_plane import CodexControlPlane, CodexCreateAmbiguous, CodexCreateRejected
 from codex_adapter.binding import (
@@ -232,6 +233,24 @@ class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["status"], "continue")
         self.assertEqual(observer.signals, [(REQUEST_ID, "confirmed")])
+
+    async def test_live_failed_turn_preserves_unsupported_chatgpt_model_reason(self):
+        client = FakeClient()
+        client.wait_outcome = turn(status="failed", text=None)
+        client.wait_outcome["error"] = {
+            "message": "The 'model-placeholder' model is not supported when using Codex with a ChatGPT account.",
+            "codexErrorInfo": "other",
+        }
+
+        result = await CodexPersistentAdapter(client, FakeResolver()).execute(request())
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["contextCommit"], "committed")
+        self.assertEqual(
+            result["error"]["message"],
+            "codex_model_not_supported_for_chatgpt_account",
+        )
+        self.assertEqual(result["diagnostics"]["stage"], "turn_wait")
 
     async def test_confirmed_start_stays_counted_when_execution_later_errors(self):
         client = FakeClient()
@@ -631,6 +650,7 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
         await client.connect()
         await client.resume_thread(THREAD_ID)
         created = await client.start_thread(cwd=Path("workspace"), model="model", base_instructions="safe")
+        await client.resume_thread(created.thread_id)
         await client.start_turn(THREAD_ID, "prompt", REQUEST_ID)
         await client.read_thread(THREAD_ID)
         await client.list_turns(THREAD_ID)
@@ -681,14 +701,75 @@ class FakeControlClient:
 
 
 class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
-    def control(self, client):
+    def test_safe_error_summary_redacts_local_and_secret_values(self):
+        summary = _safe_error_summary(
+            "failed at C:\\private\\workspace\\file.txt for "
+            "01900000-0000-7000-8000-000000000001 "
+            "channel 123456789012345678 token=super-secret-value"
+        )
+
+        self.assertNotIn("private", summary)
+        self.assertNotIn("01900000", summary)
+        self.assertNotIn("123456789012345678", summary)
+        self.assertNotIn("super-secret-value", summary)
+        self.assertIn("<path>", summary)
+        self.assertIn("<id>", summary)
+        self.assertIn("token=<redacted>", summary)
+
+    def control(self, client, available_models=()):
         return CodexControlPlane(
             client,
             cwd=Path("workspace"),
             model="model",
             base_instructions="safe",
             resolver=InMemoryBindingResolver([]),
+            available_models=available_models,
         )
+
+    async def test_model_list_returns_unique_runtime_identifiers(self):
+        def responder(payload):
+            if payload["method"] == "initialize":
+                return {"id": payload["id"], "result": {}}
+            if payload["method"] == "model/list":
+                if payload["params"].get("cursor") == "page-2":
+                    return {"id": payload["id"], "result": {"data": [
+                        {"id": "gpt-b"}, {"slug": "gpt-c"},
+                    ]}}
+                return {"id": payload["id"], "result": {"data": [
+                    {"id": "gpt-a"}, {"model": "gpt-b"}, {"id": "gpt-a"},
+                ], "nextCursor": "page-2"}}
+            return {"id": payload["id"], "result": {}}
+
+        client = CodexAppServerClient(lambda: ScriptedTransport(responder))
+        await client.connect()
+        self.assertEqual(await client.list_models(), ("gpt-a", "gpt-b", "gpt-c"))
+        await client.close()
+
+    async def test_new_empty_thread_uses_loaded_session_before_first_turn(self):
+        methods = []
+
+        def responder(payload):
+            methods.append(payload["method"])
+            if payload["method"] == "initialize":
+                result = {}
+            elif payload["method"] == "thread/start":
+                result = {"thread": {"id": "new-empty-thread"}}
+            elif payload["method"] == "thread/resume":
+                result = {"thread": {"id": payload["params"]["threadId"]}}
+            else:
+                raise AssertionError(payload["method"])
+            return {"id": payload["id"], "result": result}
+
+        transport = ScriptedTransport(responder)
+        client = CodexAppServerClient(lambda: transport)
+        await client.connect()
+        created = await client.start_thread(
+            cwd=Path("workspace"), model="model", base_instructions="safe"
+        )
+        await client.resume_thread(created.thread_id)
+
+        self.assertEqual(methods, ["initialize", "thread/start"])
+        await client.close()
 
     async def test_validate_existing_uses_resume_without_model_turn(self):
         client = FakeControlClient()
@@ -700,6 +781,12 @@ class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         client = FakeControlClient()
         self.assertEqual(await self.control(client).create(), "new-thread")
         self.assertEqual(client.create_calls, 1)
+
+    async def test_unavailable_model_is_rejected_before_thread_creation(self):
+        client = FakeControlClient()
+        with self.assertRaisesRegex(CodexCreateRejected, "choose one of"):
+            await self.control(client, ("available-model",)).create()
+        self.assertEqual(client.create_calls, 0)
 
     async def test_explicit_rejection_and_ambiguous_transport_are_distinct(self):
         rejected = FakeControlClient(AppServerRpcError(-1, "rejected"))
@@ -728,6 +815,132 @@ class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         completed = await waiter
         self.assertEqual(completed["items"][-1]["text"], "notification final")
         self.assertEqual(client.notification_methods, ["turn/completed"])
+        await client.close()
+
+    async def test_item_completed_supplies_final_text_missing_from_turn_snapshot(self):
+        transport = ScriptedTransport(
+            lambda payload: {"id": payload["id"], "result": {}}
+        )
+        client = CodexAppServerClient(lambda: transport)
+        await client.connect()
+        waiter = asyncio.create_task(client.wait_for_turn("turn-placeholder", 100))
+        await asyncio.sleep(0)
+        await client._handle_message(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": "turn-placeholder",
+                    "completedAtMs": 1,
+                    "item": {
+                        "id": "agent-item",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "notification final",
+                    },
+                },
+            }
+        )
+        await client._handle_message(
+            {
+                "method": "turn/completed",
+                "params": {"turn": turn(text=None)},
+            }
+        )
+
+        completed = await waiter
+        self.assertEqual(completed["items"][-1]["text"], "notification final")
+        self.assertEqual(
+            client.notification_methods,
+            ["item/completed", "turn/completed"],
+        )
+        await client.close()
+
+    async def test_agent_message_deltas_supply_final_text_missing_from_turn_snapshot(self):
+        transport = ScriptedTransport(
+            lambda payload: {"id": payload["id"], "result": {}}
+        )
+        client = CodexAppServerClient(lambda: transport)
+        await client.connect()
+        waiter = asyncio.create_task(client.wait_for_turn("turn-placeholder", 100))
+        await asyncio.sleep(0)
+        for delta in ("streamed ", "final"):
+            await client._handle_message(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": THREAD_ID,
+                        "turnId": "turn-placeholder",
+                        "itemId": "agent-item",
+                        "delta": delta,
+                    },
+                }
+            )
+        await client._handle_message(
+            {
+                "method": "turn/completed",
+                "params": {"turn": turn(text=None)},
+            }
+        )
+
+        completed = await waiter
+        self.assertEqual(completed["items"][-1]["text"], "streamed final")
+        self.assertEqual(
+            client.notification_methods,
+            [
+                "item/agentMessage/delta",
+                "item/agentMessage/delta",
+                "turn/completed",
+            ],
+        )
+        self.assertEqual(client._agent_message_deltas, {})
+        await client.close()
+
+    async def test_completed_item_replaces_accumulated_agent_message_delta(self):
+        transport = ScriptedTransport(
+            lambda payload: {"id": payload["id"], "result": {}}
+        )
+        client = CodexAppServerClient(lambda: transport)
+        await client.connect()
+        waiter = asyncio.create_task(client.wait_for_turn("turn-placeholder", 100))
+        await asyncio.sleep(0)
+        await client._handle_message(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": "turn-placeholder",
+                    "itemId": "agent-item",
+                    "delta": "partial",
+                },
+            }
+        )
+        await client._handle_message(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD_ID,
+                    "turnId": "turn-placeholder",
+                    "completedAtMs": 1,
+                    "item": {
+                        "id": "agent-item",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "authoritative final",
+                    },
+                },
+            }
+        )
+        await client._handle_message(
+            {
+                "method": "turn/completed",
+                "params": {"turn": turn(text=None)},
+            }
+        )
+
+        completed = await waiter
+        agent_items = [item for item in completed["items"] if item.get("type") == "agentMessage"]
+        self.assertEqual([item["text"] for item in agent_items], ["authoritative final"])
         await client.close()
 
     async def test_cancelled_waiter_is_removed(self):

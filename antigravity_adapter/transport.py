@@ -41,6 +41,7 @@ class Rendezvous:
 
 class AntigravityTransport(Protocol):
     async def health(self) -> None: ...
+    async def validate_conversation(self, conversation_id: str) -> None: ...
     async def send(self, conversation_id: str, message: str, request_id: str) -> str: ...
     async def result(self, request_id: str) -> Mapping[str, Any] | None: ...
 
@@ -55,6 +56,16 @@ class SidecarHttpClient:
         value = await asyncio.to_thread(self._call, "GET", "/health", None)
         if value.get("status") != "ready":
             raise SidecarUnavailable("Antigravity Sidecar is not ready")
+
+    async def validate_conversation(self, conversation_id: str) -> None:
+        value = await asyncio.to_thread(
+            self._call,
+            "POST",
+            "/validate-conversation",
+            {"conversationId": conversation_id},
+        )
+        if value.get("valid") is not True:
+            raise SidecarRejected("Antigravity conversation could not be validated")
 
     async def send(self, conversation_id: str, message: str, request_id: str) -> str:
         local_request_id = uuid.uuid4().hex

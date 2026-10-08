@@ -52,6 +52,10 @@ class InMemoryBindingResolver:
         raise BindingUnavailable("binding unavailable")
 
     def publish(self, binding: ResolvedBinding) -> None:
+        self.validate_publish(binding)
+        self._bindings[(binding.binding_id, binding.generation)] = binding
+
+    def validate_publish(self, binding: ResolvedBinding) -> None:
         if not binding.binding_id.strip() or not binding.conversation_id.strip():
             raise ValueError("binding and native conversation identifiers must be non-empty")
         key = (binding.binding_id, binding.generation)
@@ -60,7 +64,6 @@ class InMemoryBindingResolver:
             raise ValueError("exact binding already maps to a different native conversation")
         if any(value.conversation_id == binding.conversation_id and value != binding for value in self._bindings.values()):
             raise ValueError("native conversation is already managed by another binding")
-        self._bindings[key] = binding
 
 
 async def resolve_existing(

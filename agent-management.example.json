@@ -5,6 +5,7 @@
       "displayName": "Agent A",
       "agentAlias": "agent-a",
       "adapter": "codex",
+      "model": "gpt-5.3-codex",
       "mentionId": "123456789012345678",
       "senderId": "shared-main",
       "enabled": true,

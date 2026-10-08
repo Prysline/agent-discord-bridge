@@ -15,8 +15,14 @@ from urllib import error, request as urllib_request
 from agent_bridge import ConversationPolicy, Participant
 from agent_bridge.heterogeneous_composition import compose_existing_heterogeneous_root
 from agent_bridge.orchestrator import BindingSnapshot, SharedOrchestrator
-from antigravity_adapter.binding import BindingGenerationMismatch, BindingUnavailable
+from antigravity_adapter.binding import (
+    BindingGenerationMismatch,
+    BindingUnavailable,
+    InMemoryBindingResolver,
+    ResolvedBinding,
+)
 from antigravity_adapter.binding_bootstrap import bootstrap_existing_bindings
+from antigravity_adapter.control_plane import AntigravityControlPlane
 from antigravity_adapter.persistent import AntigravityPersistentAdapter
 from antigravity_adapter.transport import SidecarAmbiguous, SidecarHttpClient, SidecarRejected, SidecarUnavailable
 from antigravity_adapter.sidecar import worker
@@ -414,7 +420,84 @@ class HeterogeneousCompositionTests(unittest.TestCase):
         self.assertNotIn("thread-a", transport.sends[0][1])
 
 
+class AntigravityControlPlaneTests(unittest.TestCase):
+    def test_existing_conversation_can_be_validated_published_and_resolved(self):
+        class Transport:
+            def __init__(self): self.validated = []
+            async def validate_conversation(self, conversation_id):
+                self.validated.append(conversation_id)
+
+        transport = Transport()
+        resolver = InMemoryBindingResolver([])
+        control = AntigravityControlPlane(transport, resolver)
+
+        asyncio.run(control.validate_existing("conversation-existing"))
+        control.validate_publication("binding-new", 1, "conversation-existing")
+        control.publish("binding-new", 1, "conversation-existing")
+
+        self.assertEqual(transport.validated, ["conversation-existing"])
+        self.assertFalse(control.can_create)
+        self.assertEqual(
+            asyncio.run(resolver.resolve("binding-new", 1)),
+            ResolvedBinding("binding-new", 1, "conversation-existing"),
+        )
+        self.assertEqual(
+            control.mapping_entry("binding-new", 1, "conversation-existing"),
+            {"bindingId":"binding-new", "generation":1, "conversationId":"conversation-existing"},
+        )
+
+    def test_validation_failure_does_not_publish_or_enable_create(self):
+        class Transport:
+            async def validate_conversation(self, conversation_id):
+                raise SidecarRejected("conversation_unavailable")
+
+        resolver = InMemoryBindingResolver([])
+        control = AntigravityControlPlane(Transport(), resolver)
+
+        with self.assertRaisesRegex(ValueError, "找不到此 Antigravity Conversation"):
+            asyncio.run(control.validate_existing("missing"))
+        with self.assertRaisesRegex(ValueError, "creation is not supported"):
+            asyncio.run(control.create())
+        with self.assertRaises(BindingUnavailable):
+            asyncio.run(resolver.resolve("binding-new", 1))
+
+
 class SidecarHttpClientTests(unittest.TestCase):
+    def test_validate_conversation_uses_read_only_sidecar_endpoint(self):
+        client = SidecarHttpClient("unused.json")
+        with patch.object(client, "_call", return_value={"valid": True}) as call:
+            asyncio.run(client.validate_conversation("existing-conversation"))
+        call.assert_called_once_with(
+            "POST",
+            "/validate-conversation",
+            {"conversationId": "existing-conversation"},
+        )
+
+    def test_authenticated_http_validation_does_not_dispatch(self):
+        class ValidationState:
+            def __init__(self): self.validated = []
+            def validate_conversation(self, conversation_id):
+                self.validated.append(conversation_id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = ValidationState()
+            server = worker.Server(("127.0.0.1", 0), worker.Handler)
+            server.state = state
+            server.token = "test-token"
+            server.instance_id = "test-instance"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            path = Path(directory) / "runtime.json"
+            path.write_text(json.dumps({
+                "host":"127.0.0.1", "port":server.server_address[1],
+                "instanceId":"test-instance", "token":"test-token",
+            }), encoding="utf-8")
+            try:
+                asyncio.run(SidecarHttpClient(path).validate_conversation("existing"))
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
+        self.assertEqual(state.validated, ["existing"])
+
     def test_rendezvous_must_be_loopback_and_diagnostics_hide_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.json"
@@ -461,6 +544,19 @@ class SidecarCorrelationTests(unittest.TestCase):
             "\n".join(json.dumps(item) for item in records) + "\n",
             encoding="utf-8",
         )
+
+    def test_conversation_validation_is_read_only_and_requires_existing_transcript(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            with self.assertRaisesRegex(worker.SidecarFailure, "conversation_unavailable"):
+                state.validate_conversation("missing")
+            transcript = self.transcript(state, "existing")
+            transcript.write_text("", encoding="utf-8")
+
+            state.validate_conversation("existing")
+
+            self.assertEqual(state.requests, {})
+            self.assertIsNone(state.pending_id)
 
     def final_records(self, pending, text="final"):
         return [

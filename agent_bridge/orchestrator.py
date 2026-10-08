@@ -278,6 +278,28 @@ class SharedOrchestrator:
         self.bindings[target] = binding
         return binding
 
+    def move_room_bindings(
+        self, source_room_id: str, target_room_id: str, agent_ids: tuple[str, ...]
+    ) -> None:
+        if not agent_ids:
+            raise ValueError("source room has no active bindings")
+        if len(agent_ids) != len(set(agent_ids)):
+            raise ValueError("agent_ids must be unique")
+        for agent_id in agent_ids:
+            if (source_room_id, agent_id) not in self.bindings:
+                raise ValueError("source room+agent has no active binding")
+            if (target_room_id, agent_id) in self.bindings:
+                raise ValueError("target room+agent already has an active binding")
+            self.require_binding_idle(source_room_id, agent_id)
+        moved = {
+            agent_id: self.bindings[(source_room_id, agent_id)]
+            for agent_id in agent_ids
+        }
+        for agent_id in agent_ids:
+            del self.bindings[(source_room_id, agent_id)]
+        for agent_id, binding in moved.items():
+            self.bindings[(target_room_id, agent_id)] = binding
+
     def require_binding_idle(self, room_id: str, agent_id: str) -> None:
         if self._room_is_busy(room_id, agent_id):
             raise ValueError("binding has active work or an unresolved fence")
@@ -513,7 +535,9 @@ class SharedOrchestrator:
             self._discussion_requests.pop(request_id, None)
             if token is not None:
                 self.policy.fail_dispatch(room_id, token, reason="adapter_error")
-            return CoreOutcome("adapter-error", request_id, agent_id)
+            return CoreOutcome(
+                "adapter-error", request_id, agent_id, result["error"]["message"]
+            )
         if token is not None:
             recorded = self.policy.record_result(
                 room_id,

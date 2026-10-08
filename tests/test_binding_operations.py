@@ -33,6 +33,7 @@ class Delivery:
 class NativeControl:
     adapter = "codex"
     mapping_field = "codexBindings"
+    can_create = True
 
     def __init__(self, *, created="native-created", existing=None, validation_error=None):
         self.created = created
@@ -172,6 +173,109 @@ class BindingOperationsTests(unittest.TestCase):
             self.assertEqual(native.calls[0], ("create",))
             self.assertEqual(len(adapter.requests), 1)
             self.assertEqual(native.published, [("logical-new", 1, "created-thread")])
+
+    def test_native_control_can_offer_bind_existing_without_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            path.write_text(json.dumps(self.seed_document()), encoding="utf-8")
+            native = NativeControl()
+            native.can_create = False
+            _, _, control = self.pending(path, native=native)
+
+            pending = control.state()["pendingOnboarding"][0]
+
+            self.assertTrue(pending["canBindExisting"])
+            self.assertFalse(pending["canCreate"])
+
+    def test_direct_bind_existing_creates_binding_without_human_event_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            path.write_text(json.dumps(self.seed_document()), encoding="utf-8")
+            native = NativeControl()
+            bridge, adapter = root({})
+            control = BindingAdminControl(
+                BindingOperations(path, bridge),
+                adapter_types={"a": "codex"},
+                display_names={"a": "Agent A"},
+                native_controls={"a": native},
+                enabled_agents={"a"},
+                binding_id_factory=lambda: "logical-direct",
+            )
+
+            asyncio.run(control.bind_existing_direct("channel", "a", "thread-direct"))
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["activeBindings"][0]["roomId"], "channel")
+            self.assertEqual(saved["codexBindings"][-1]["threadId"], "thread-direct")
+            self.assertEqual(
+                bridge.core.binding("channel", "a"),
+                BindingSnapshot("logical-direct", 1),
+            )
+            self.assertEqual(bridge.core.log.events("channel"), ())
+            self.assertEqual(adapter.requests, [])
+            self.assertEqual(bridge.pending_onboarding(), ())
+
+            result = asyncio.run(bridge.handle(
+                allowed=True, is_peer=False, room_id="channel", author_id="h",
+                display_name="H", text="first real message", mentions_agent=True,
+            ))
+            events = bridge.core.log.events("channel")
+            self.assertEqual(result.action, "handled")
+            self.assertEqual(len(adapter.requests), 1)
+            self.assertEqual(events[0].author_type, "human")
+            self.assertEqual(events[0].text, "first real message")
+
+    def test_direct_create_registers_confirmed_native_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            path.write_text(json.dumps(self.seed_document()), encoding="utf-8")
+            native = NativeControl(created="created-direct")
+            bridge, adapter = root({})
+            control = BindingAdminControl(
+                BindingOperations(path, bridge),
+                adapter_types={"a": "codex"},
+                display_names={"a": "Agent A"},
+                native_controls={"a": native},
+                enabled_agents={"a"},
+                binding_id_factory=lambda: "logical-direct",
+            )
+
+            asyncio.run(control.create_direct("channel", "a"))
+
+            self.assertEqual(native.calls[0], ("create",))
+            self.assertEqual(native.published, [("logical-direct", 1, "created-direct")])
+            self.assertEqual(bridge.core.log.events("channel"), ())
+            self.assertEqual(adapter.requests, [])
+
+    def test_direct_binding_rejects_disabled_agent_and_pending_human_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            path.write_text(json.dumps(self.seed_document()), encoding="utf-8")
+            native = NativeControl()
+            bridge, adapter = root({})
+            disabled = BindingAdminControl(
+                BindingOperations(path, bridge),
+                adapter_types={"a": "codex"}, display_names={"a": "Agent A"},
+                native_controls={"a": native}, enabled_agents=set(),
+            )
+            with self.assertRaisesRegex(ValueError, "未啟用"):
+                asyncio.run(disabled.bind_existing_direct("channel", "a", "thread"))
+
+            asyncio.run(bridge.handle(
+                allowed=True, is_peer=False, room_id="channel", author_id="h",
+                display_name="H", text="retained human turn", mentions_agent=True,
+            ))
+            enabled = BindingAdminControl(
+                BindingOperations(path, bridge),
+                adapter_types={"a": "codex"}, display_names={"a": "Agent A"},
+                native_controls={"a": native}, enabled_agents={"a"},
+            )
+            with self.assertRaisesRegex(ValueError, "pending onboarding"):
+                asyncio.run(enabled.create_direct("channel", "a"))
+
+            self.assertEqual(native.calls, [])
+            self.assertEqual(adapter.requests, [])
+            self.assertEqual(len(bridge.pending_onboarding()), 1)
 
     def test_created_native_persistence_failure_stays_unmanaged_and_pending(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -346,6 +450,81 @@ class BindingOperationsTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), document)
             self.assertIsNotNone(bridge.core.binding("old", "a"))
             self.assertIsNone(bridge.core.binding("new", "a"))
+
+    def test_room_move_persists_and_publishes_all_bindings_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            document = {
+                "bindingLineages": [
+                    {"bindingId": "ba", "agentId": "a", "generations": [1]},
+                    {"bindingId": "bb", "agentId": "b", "generations": [2]},
+                ],
+                "activeBindings": [
+                    {"roomId": "old", "agentId": "a", "bindingId": "ba", "activeGeneration": 1},
+                    {"roomId": "old", "agentId": "b", "bindingId": "bb", "activeGeneration": 2},
+                ],
+                "codexBindings": [
+                    {"bindingId": "ba", "generation": 1, "threadId": "ta"},
+                    {"bindingId": "bb", "generation": 2, "threadId": "tb"},
+                ], "antigravityBindings": [],
+            }
+            path.write_text(json.dumps(document), encoding="utf-8")
+            participants = [Participant("a", "1", 100, 2), Participant("b", "2", 100, 2)]
+            core = SharedOrchestrator(policy=ConversationPolicy(participants, global_max_dispatches=4), adapters={"a":Adapter(),"b":Adapter()},
+                bindings={("old","a"):BindingSnapshot("ba",1),("old","b"):BindingSnapshot("bb",2)}, delivery=Delivery())
+            bridge = RootSharedHumanTurn(core, "a", participants)
+            control = BindingAdminControl(BindingOperations(path, bridge), adapter_types={"a":"codex","b":"codex"},
+                display_names={"a":"A","b":"B"}, native_controls={"a":NativeControl(),"b":NativeControl()})
+
+            asyncio.run(control.move_room("old", "new"))
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual({entry["roomId"] for entry in saved["activeBindings"]}, {"new"})
+            self.assertIsNone(core.binding("old", "a")); self.assertIsNone(core.binding("old", "b"))
+            self.assertEqual(core.binding("new", "a"), BindingSnapshot("ba", 1))
+            self.assertEqual(core.binding("new", "b"), BindingSnapshot("bb", 2))
+
+    def test_room_move_failure_changes_neither_persistence_nor_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            document = {
+                "bindingLineages": [{"bindingId":"ba","agentId":"a","generations":[1]},{"bindingId":"bb","agentId":"b","generations":[1]}],
+                "activeBindings": [{"roomId":"old","agentId":"a","bindingId":"ba","activeGeneration":1},{"roomId":"old","agentId":"b","bindingId":"bb","activeGeneration":1}],
+                "codexBindings": [{"bindingId":"ba","generation":1,"threadId":"ta"}], "antigravityBindings": [],
+            }
+            path.write_text(json.dumps(document), encoding="utf-8")
+            participants=[Participant("a","1",100,2),Participant("b","2",100,2)]
+            core=SharedOrchestrator(policy=ConversationPolicy(participants,global_max_dispatches=4),adapters={"a":Adapter(),"b":Adapter()},bindings={("old","a"):BindingSnapshot("ba",1),("old","b"):BindingSnapshot("bb",1)},delivery=Delivery())
+            bridge=RootSharedHumanTurn(core,"a",participants)
+            control=BindingAdminControl(BindingOperations(path,bridge),adapter_types={"a":"codex","b":"codex"},display_names={},native_controls={"a":NativeControl(),"b":NativeControl()})
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                asyncio.run(control.move_room("old", "new"))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), document)
+            self.assertIsNotNone(core.binding("old","a")); self.assertIsNotNone(core.binding("old","b"))
+            self.assertIsNone(core.binding("new","a")); self.assertIsNone(core.binding("new","b"))
+
+    def test_room_move_persistence_failure_does_not_publish_runtime_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.local.json"
+            document = {
+                "bindingLineages": [{"bindingId":"ba","agentId":"a","generations":[1]},{"bindingId":"bb","agentId":"b","generations":[1]}],
+                "activeBindings": [{"roomId":"old","agentId":"a","bindingId":"ba","activeGeneration":1},{"roomId":"old","agentId":"b","bindingId":"bb","activeGeneration":1}],
+                "codexBindings": [{"bindingId":"ba","generation":1,"threadId":"ta"},{"bindingId":"bb","generation":1,"threadId":"tb"}],
+                "antigravityBindings": [],
+            }
+            path.write_text(json.dumps(document), encoding="utf-8")
+            participants=[Participant("a","1",100,2),Participant("b","2",100,2)]
+            core=SharedOrchestrator(policy=ConversationPolicy(participants,global_max_dispatches=4),adapters={"a":Adapter(),"b":Adapter()},bindings={("old","a"):BindingSnapshot("ba",1),("old","b"):BindingSnapshot("bb",1)},delivery=Delivery())
+            bridge=RootSharedHumanTurn(core,"a",participants)
+            control=BindingAdminControl(BindingOperations(path,bridge),adapter_types={"a":"codex","b":"codex"},display_names={},native_controls={"a":NativeControl(),"b":NativeControl()})
+
+            with patch("agent_bridge.binding_operations.save_binding_document", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    asyncio.run(control.move_room("old", "new"))
+
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), document)
+            self.assertIsNotNone(core.binding("old","a")); self.assertIsNotNone(core.binding("old","b"))
+            self.assertIsNone(core.binding("new","a")); self.assertIsNone(core.binding("new","b"))
 
     def test_unbind_then_next_human_turn_enters_onboarding(self):
         with tempfile.TemporaryDirectory() as directory:

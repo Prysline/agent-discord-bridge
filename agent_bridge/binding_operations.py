@@ -36,6 +36,22 @@ class BindingOperations:
             room_id, agent_id, self._snapshot(binding_id, generation)
         )
 
+    def attach_configured(
+        self, room_id: str, agent_id: str, binding_id: str, generation: int
+    ) -> None:
+        """Attach without synthesizing or dispatching a human turn."""
+        raw, control = self._load()
+        if self.root.core.binding(room_id, agent_id) is not None:
+            raise ValueError("room+agent already has an active runtime binding")
+        if (room_id, agent_id) in control.snapshot().active_by_room_agent:
+            raise ValueError("room+agent already has an active persisted binding")
+        _require_unique_native_mapping(raw, binding_id, generation)
+        control.attach((room_id, agent_id), BindingRef(binding_id, generation))
+        save_binding_document(self.path, document_from_snapshot(raw, control.snapshot()))
+        self.root.core.publish_binding(
+            room_id, agent_id, self._snapshot(binding_id, generation)
+        )
+
     def move(self, source_room_id: str, target_room_id: str, agent_id: str) -> None:
         raw, control = self._load()
         if self.root.core.binding(source_room_id, agent_id) is None:
@@ -48,6 +64,36 @@ class BindingOperations:
         control.move((source_room_id, agent_id), (target_room_id, agent_id))
         save_binding_document(self.path, document_from_snapshot(raw, control.snapshot()))
         self.root.core.move_binding(source_room_id, target_room_id, agent_id)
+
+    def move_room(self, source_room_id: str, target_room_id: str) -> None:
+        raw, control = self._load()
+        snapshot = control.snapshot()
+        entries = sorted(
+            (
+                (agent_id, ref)
+                for (room_id, agent_id), ref in snapshot.active_by_room_agent.items()
+                if room_id == source_room_id
+            ),
+            key=lambda item: item[0],
+        )
+        if not entries:
+            raise ValueError("source room has no active bindings")
+        for agent_id, ref in entries:
+            runtime = self.root.core.binding(source_room_id, agent_id)
+            if runtime is None or runtime.binding_id != ref.binding_id or runtime.generation != ref.generation:
+                raise ValueError("persisted and runtime binding state differ")
+            if self.root.core.binding(target_room_id, agent_id) is not None:
+                raise ValueError("target room+agent already has an active runtime binding")
+            if (target_room_id, agent_id) in snapshot.active_by_room_agent:
+                raise ValueError("target room+agent already has an active persisted binding")
+            self.root.core.require_binding_idle(source_room_id, agent_id)
+            _require_unique_native_mapping(raw, ref.binding_id, ref.generation)
+        for agent_id, _ in entries:
+            control.move((source_room_id, agent_id), (target_room_id, agent_id))
+        save_binding_document(self.path, document_from_snapshot(raw, control.snapshot()))
+        self.root.core.move_room_bindings(
+            source_room_id, target_room_id, tuple(agent_id for agent_id, _ in entries)
+        )
 
     def unbind(self, room_id: str, agent_id: str) -> None:
         raw, control = self._load()
@@ -72,6 +118,7 @@ class BindingOperations:
 class NativeBindingControl(Protocol):
     adapter: str
     mapping_field: str
+    can_create: bool
     async def validate_existing(self, native_reference: str) -> None: ...
     async def create(self) -> str: ...
     def find_mapping(self, raw: dict[str, object], native_reference: str) -> tuple[str, int] | None: ...
@@ -94,12 +141,16 @@ class BindingAdminControl:
         adapter_types: Mapping[str, str],
         display_names: Mapping[str, str],
         native_controls: Mapping[str, NativeBindingControl] | None = None,
+        enabled_agents: set[str] | None = None,
         binding_id_factory=None,
     ) -> None:
         self.operations = operations
         self.adapter_types = dict(adapter_types)
         self.display_names = dict(display_names)
         self.native_controls = dict(native_controls or {})
+        self.enabled_agents = set(
+            self.adapter_types if enabled_agents is None else enabled_agents
+        )
         self.binding_id_factory = binding_id_factory or (lambda: uuid4().hex)
         self._lock = asyncio.Lock()
 
@@ -138,7 +189,9 @@ class BindingAdminControl:
                 "createdAt": item.created_at,
                 "status": "pending",
                 "triggerPreview": item.trigger_preview,
-                "canCreate": item.agent_id in self.native_controls,
+                "canCreate": item.agent_id in self.native_controls and bool(
+                    getattr(self.native_controls.get(item.agent_id), "can_create", True)
+                ),
                 "canBindExisting": item.agent_id in self.native_controls,
             }
             for item in self.operations.root.pending_onboarding()
@@ -190,6 +243,42 @@ class BindingAdminControl:
                     "聊天窗可能已建立，但 Bridge 尚未完成納管；請在本地 APP 檢查後使用綁定既有聊天窗。"
                 ) from exc
 
+    async def bind_existing_direct(
+        self, room_id: str, agent_id: str, native_reference: str
+    ) -> None:
+        async with self._lock:
+            self._require_direct_target(room_id, agent_id)
+            native = self._native(agent_id)
+            await native.validate_existing(native_reference)
+            raw, control = self.operations._load()
+            existing = native.find_mapping(raw, native_reference)
+            if existing is not None:
+                await self._validate_managed_binding(agent_id, existing[0], existing[1])
+                self.operations.attach_configured(
+                    room_id, agent_id, existing[0], existing[1]
+                )
+                return
+            self._register_direct(
+                raw, control, room_id, agent_id, native_reference, native
+            )
+
+    async def create_direct(self, room_id: str, agent_id: str) -> None:
+        async with self._lock:
+            self._require_direct_target(room_id, agent_id)
+            native = self._native(agent_id)
+            if not bool(getattr(native, "can_create", True)):
+                raise ValueError("這個 Adapter 不支援建立新的聊天窗")
+            native_reference = await native.create()
+            raw, control = self.operations._load()
+            try:
+                self._register_direct(
+                    raw, control, room_id, agent_id, native_reference, native
+                )
+            except OSError as exc:
+                raise NativeCreatedUnmanaged(
+                    "聊天窗可能已建立，但 Bridge 尚未完成納管；請在本地 APP 檢查後使用綁定既有聊天窗。"
+                ) from exc
+
     async def move(self, source_room_id: str, target_room_id: str, agent_id: str) -> None:
         async with self._lock:
             binding = self.operations.root.core.binding(source_room_id, agent_id)
@@ -199,6 +288,22 @@ class BindingAdminControl:
                 agent_id, binding.binding_id, binding.generation
             )
             self.operations.move(source_room_id, target_room_id, agent_id)
+
+    async def move_room(self, source_room_id: str, target_room_id: str) -> None:
+        async with self._lock:
+            raw, control = self.operations._load()
+            entries = [
+                (agent_id, ref)
+                for (room_id, agent_id), ref in control.snapshot().active_by_room_agent.items()
+                if room_id == source_room_id
+            ]
+            if not entries:
+                raise ValueError("source room has no active bindings")
+            for agent_id, ref in entries:
+                await self._validate_managed_binding(
+                    agent_id, ref.binding_id, ref.generation
+                )
+            self.operations.move_room(source_room_id, target_room_id)
 
     async def unbind(self, room_id: str, agent_id: str) -> None:
         async with self._lock:
@@ -216,6 +321,20 @@ class BindingAdminControl:
             for item in self.operations.root.pending_onboarding()
         ):
             raise ValueError("room+agent has no pending onboarding")
+
+    def _require_direct_target(self, room_id: str, agent_id: str) -> None:
+        if agent_id not in self.enabled_agents:
+            raise ValueError("agentId: Agent 未啟用")
+        if any(
+            item.room_id == room_id and item.agent_id == agent_id
+            for item in self.operations.root.pending_onboarding()
+        ):
+            raise ValueError("room+agent 尚有 pending onboarding；請先完成或取消")
+        raw, control = self.operations._load()
+        if self.operations.root.core.binding(room_id, agent_id) is not None:
+            raise ValueError("room+agent already has an active runtime binding")
+        if (room_id, agent_id) in control.snapshot().active_by_room_agent:
+            raise ValueError("room+agent already has an active persisted binding")
 
     async def _validate_managed_binding(
         self, agent_id: str, binding_id: str, generation: int
@@ -251,6 +370,23 @@ class BindingAdminControl:
         save_binding_document(self.operations.path, document_from_snapshot(raw, control.snapshot()))
         native.publish(binding_id, generation, native_reference)
         return await self.operations.root.complete_onboarding(
+            room_id, agent_id, self.operations._snapshot(binding_id, generation)
+        )
+
+    def _register_direct(self, raw, control, room_id, agent_id, native_reference, native) -> None:
+        binding_id = self.binding_id_factory()
+        generation = 1
+        from .binding_control import BindingGenerationRecord, BindingLineage
+        control.register_lineage(BindingLineage(binding_id, agent_id, (BindingGenerationRecord(generation),)))
+        control.attach((room_id, agent_id), BindingRef(binding_id, generation))
+        native.validate_publication(binding_id, generation, native_reference)
+        raw = dict(raw)
+        entries = list(raw.get(native.mapping_field, []))
+        entries.append(native.mapping_entry(binding_id, generation, native_reference))
+        raw[native.mapping_field] = entries
+        save_binding_document(self.operations.path, document_from_snapshot(raw, control.snapshot()))
+        native.publish(binding_id, generation, native_reference)
+        self.operations.root.core.publish_binding(
             room_id, agent_id, self.operations._snapshot(binding_id, generation)
         )
 

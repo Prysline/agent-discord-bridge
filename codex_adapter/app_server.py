@@ -5,10 +5,36 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+
+log = logging.getLogger(__name__)
+
+
+def _safe_error_summary(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "<missing>"
+    text = " ".join(value.split())
+    text = re.sub(
+        r"(?i)\b(bearer|token|api[_ -]?key)\b\s*[:=]?\s*\S+",
+        r"\1=<redacted>",
+        text,
+    )
+    text = re.sub(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        "<id>",
+        text,
+    )
+    text = re.sub(r"(?i)\b[A-Z]:\\[^\s]+", "<path>", text)
+    text = re.sub(r"(?<!\w)/(?:[^\s/]+/)+[^\s]+", "<path>", text)
+    text = re.sub(r"\b\d{12,}\b", "<id>", text)
+    text = re.sub(r"\b[A-Za-z0-9_-]{32,}\b", "<opaque>", text)
+    return text[:240]
 
 
 class AppServerError(RuntimeError):
@@ -203,7 +229,10 @@ class CodexAppServerClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._turn_waiters: dict[str, asyncio.Future] = {}
         self._completed_turns: dict[str, dict[str, Any]] = {}
+        self._completed_items: dict[str, dict[str, dict[str, Any]]] = {}
+        self._agent_message_deltas: dict[str, dict[str, list[str]]] = {}
         self._delivered_turns: set[str] = set()
+        self._loaded_threads: set[str] = set()
         self.notification_methods: list[str] = []
         self._connect_lock = asyncio.Lock()
         self._initialized = False
@@ -247,11 +276,41 @@ class CodexAppServerClient:
         return result
 
     async def resume_thread(self, thread_id: str) -> dict[str, Any]:
+        if thread_id in self._loaded_threads:
+            return {"thread": {"id": thread_id}}
         result = await self._request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
         thread = _require_object(result.get("thread"), "thread/resume.thread")
         if thread.get("id") != thread_id:
             raise AppServerProtocolError("thread/resume returned a different thread")
+        self._loaded_threads.add(thread_id)
         return result
+
+    async def list_models(self) -> tuple[str, ...]:
+        identifiers: list[str] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {"limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("model/list", params)
+            values = result.get("data", result.get("models", []))
+            if not isinstance(values, list):
+                raise AppServerProtocolError("model/list returned a malformed model list")
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                identifier = value.get("id") or value.get("model") or value.get("slug")
+                if isinstance(identifier, str) and identifier and identifier not in identifiers:
+                    identifiers.append(identifier)
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return tuple(identifiers)
+            if not isinstance(cursor, str) or not cursor:
+                raise AppServerProtocolError("model/list returned an invalid cursor")
+            if cursor in seen_cursors:
+                raise AppServerProtocolError("model/list repeated a cursor")
+            seen_cursors.add(cursor)
 
     async def start_thread(
         self, *, cwd: Path, model: str, base_instructions: str
@@ -271,6 +330,7 @@ class CodexAppServerClient:
         thread_id = thread.get("id")
         if not isinstance(thread_id, str) or not thread_id:
             raise AppServerProtocolError("thread/start returned a malformed thread")
+        self._loaded_threads.add(thread_id)
         return ThreadReference(thread_id)
 
     async def start_turn(
@@ -330,7 +390,7 @@ class CodexAppServerClient:
                     or not isinstance(turn.get("items"), list)
                 ):
                     raise AppServerProtocolError("thread/turns/list returned malformed turn data")
-            turns.extend(data)
+            turns.extend(self._with_completed_items(turn) for turn in data)
             cursor = result.get("nextCursor")
             if cursor is None:
                 return turns
@@ -364,7 +424,10 @@ class CodexAppServerClient:
     async def _close_locked(self) -> None:
         self._fail_pending(AppServerTransportError("app-server client closed"))
         self._completed_turns.clear()
+        self._completed_items.clear()
+        self._agent_message_deltas.clear()
         self._delivered_turns.clear()
+        self._loaded_threads.clear()
         self._initialized = False
         transport = self._transport
         self._transport = None
@@ -446,11 +509,80 @@ class CodexAppServerClient:
                 )
             return
         self.notification_methods.append(method)
+        if method == "item/agentMessage/delta":
+            params = _require_object(message.get("params"), "item/agentMessage/delta.params")
+            turn_id = params.get("turnId")
+            item_id = params.get("itemId")
+            delta = params.get("delta")
+            if not isinstance(turn_id, str) or not turn_id:
+                raise AppServerProtocolError("item/agentMessage/delta has a malformed turnId")
+            if not isinstance(item_id, str) or not item_id:
+                raise AppServerProtocolError("item/agentMessage/delta has a malformed itemId")
+            if not isinstance(delta, str):
+                raise AppServerProtocolError("item/agentMessage/delta has a malformed delta")
+            if turn_id in self._delivered_turns or turn_id in self._completed_turns:
+                return
+            self._agent_message_deltas.setdefault(turn_id, {}).setdefault(item_id, []).append(delta)
+            return
+        if method == "item/completed":
+            params = _require_object(message.get("params"), "item/completed.params")
+            turn_id = params.get("turnId")
+            item = _require_object(params.get("item"), "item/completed.item")
+            item_id = item.get("id")
+            if not isinstance(turn_id, str) or not turn_id:
+                raise AppServerProtocolError("item/completed has a malformed turnId")
+            if not isinstance(item_id, str) or not item_id:
+                raise AppServerProtocolError("item/completed has a malformed item id")
+            if turn_id in self._delivered_turns or turn_id in self._completed_turns:
+                return
+            self._completed_items.setdefault(turn_id, {})[item_id] = dict(item)
+            deltas = self._agent_message_deltas.get(turn_id)
+            if deltas is not None:
+                deltas.pop(item_id, None)
+                if not deltas:
+                    self._agent_message_deltas.pop(turn_id, None)
+            return
         if method == "turn/completed":
             params = _require_object(message.get("params"), "turn/completed.params")
             turn = _require_object(params.get("turn"), "turn/completed.turn")
             turn_id = turn.get("id")
             if isinstance(turn_id, str) and turn_id:
+                snapshot_items = turn.get("items")
+                snapshot_types = (
+                    [
+                        item.get("type", "<missing>")
+                        for item in snapshot_items
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(snapshot_items, list)
+                    else ["<malformed>"]
+                )
+                completed_types = [
+                    item.get("type", "<missing>")
+                    for item in self._completed_items.get(turn_id, {}).values()
+                ]
+                error = turn.get("error")
+                error_info = error.get("codexErrorInfo") if isinstance(error, dict) else None
+                if isinstance(error_info, str):
+                    error_kind = error_info
+                elif isinstance(error_info, dict) and error_info:
+                    error_kind = next(iter(error_info))
+                elif isinstance(error, dict):
+                    error_kind = "unclassified"
+                else:
+                    error_kind = "none"
+                log.info(
+                    "Codex turn completed event: status=%s error_kind=%s error_summary=%s snapshot_types=%s completed_types=%s delta_items=%d",
+                    turn.get("status"),
+                    error_kind,
+                    _safe_error_summary(error.get("message") if isinstance(error, dict) else None),
+                    snapshot_types,
+                    completed_types,
+                    len(self._agent_message_deltas.get(turn_id, {})),
+                )
+                turn = self._with_completed_items(turn)
+                self._completed_items.pop(turn_id, None)
+                self._agent_message_deltas.pop(turn_id, None)
                 if turn_id in self._delivered_turns or turn_id in self._completed_turns:
                     return
                 waiter = self._turn_waiters.pop(turn_id, None)
@@ -460,7 +592,43 @@ class CodexAppServerClient:
                 else:
                     self._completed_turns[turn_id] = dict(turn)
 
+    def _with_completed_items(self, turn: dict[str, Any]) -> dict[str, Any]:
+        turn_id = turn.get("id")
+        if not isinstance(turn_id, str) or not turn_id:
+            return dict(turn)
+        cached = self._completed_items.get(turn_id, {})
+        deltas = self._agent_message_deltas.get(turn_id, {})
+        if not cached and not deltas:
+            return dict(turn)
+        items = turn.get("items")
+        if not isinstance(items, list):
+            return dict(turn)
+        merged = [dict(item) if isinstance(item, dict) else item for item in items]
+        known_ids = {
+            item.get("id")
+            for item in merged
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        merged.extend(dict(item) for item_id, item in cached.items() if item_id not in known_ids)
+        known_ids.update(cached)
+        merged.extend(
+            {
+                "id": item_id,
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "".join(parts),
+            }
+            for item_id, parts in deltas.items()
+            if item_id not in known_ids and "".join(parts)
+        )
+        result = dict(turn)
+        result["items"] = merged
+        return result
+
     async def _handle_disconnect(self, error: Exception) -> None:
+        self._loaded_threads.clear()
+        self._completed_items.clear()
+        self._agent_message_deltas.clear()
         if isinstance(error, AppServerError):
             exc = error
         else:

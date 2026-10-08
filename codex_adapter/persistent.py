@@ -325,6 +325,15 @@ class CodexPersistentAdapter:
                 turn_id,
                 max(1, int(_remaining_seconds(deadline) * 1000)),
             )
+            if completed.get("status") in {"failed", "interrupted", "cancelled"}:
+                return error_result(
+                    request_id,
+                    "committed",
+                    "execution_error",
+                    _turn_failure_message(completed),
+                    False,
+                    "turn_wait",
+                )
             direct = extract_final_text(completed)
             if direct is not None:
                 return continue_result(request_id, direct)
@@ -467,7 +476,7 @@ class CodexPersistentAdapter:
                             request_id,
                             context_commit,
                             "execution_error",
-                            f"Codex turn ended with status={status}",
+                            _turn_failure_message(turn),
                             False,
                             "final_recovery",
                         )
@@ -631,6 +640,16 @@ def extract_final_text(turn: Mapping[str, Any]) -> str | None:
     if not final_items and len(agent_items) == 1:
         return agent_items[0]["text"].strip()
     return None
+
+
+def _turn_failure_message(turn: Mapping[str, Any]) -> str:
+    error = turn.get("error")
+    message = error.get("message") if isinstance(error, Mapping) else None
+    if isinstance(message, str) and (
+        "model is not supported when using Codex with a ChatGPT account" in message
+    ):
+        return "codex_model_not_supported_for_chatgpt_account"
+    return f"Codex turn ended with status={turn.get('status', 'unknown')}"
 
 
 def _remaining_seconds(deadline: float) -> float:

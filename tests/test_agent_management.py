@@ -21,10 +21,12 @@ def valid_raw():
     return {
         "agents": [
             {"agentId":"a", "displayName":"Agent A", "agentAlias":"planner", "adapter":"codex",
-             "mentionId":"123456789012345678", "senderId":"shared", "enabled":True,
+             "model":"gpt-test",
+             "mentionId":"323456789012345678", "senderId":"shared", "enabled":True,
              "available":True, "budgetChars":2000, "maxCalls":5},
             {"agentId":"b", "displayName":"Agent B", "agentAlias":"coder", "adapter":"antigravity",
-             "mentionId":"223456789012345678", "senderId":"shared", "enabled":True,
+             "model":"",
+             "mentionId":"323456789012345678", "senderId":"shared", "enabled":True,
              "available":True, "budgetChars":2000, "maxCalls":5},
         ],
         "senders": [
@@ -57,14 +59,40 @@ class FakeBindingAdmin:
     async def cancel_pending(self, room_id, agent_id): self.calls.append(("cancel",room_id,agent_id)); return True
     async def bind_existing(self, room_id, agent_id, native_reference): self.calls.append(("bind-existing",room_id,agent_id,native_reference))
     async def create_pending(self, room_id, agent_id): self.calls.append(("create",room_id,agent_id))
+    async def bind_existing_direct(self, room_id, agent_id, native_reference): self.calls.append(("direct-bind-existing",room_id,agent_id,native_reference))
+    async def create_direct(self, room_id, agent_id): self.calls.append(("direct-create",room_id,agent_id))
+    async def move_room(self, source_room_id, target_room_id): self.calls.append(("move-room",source_room_id,target_room_id))
 
 
 class AgentManagementTests(unittest.TestCase):
+    def test_admin_access_policy_uses_labels_but_authorizes_by_numeric_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); managed=root/"agent-management.local.json"; save_agent_management(managed,parse_agent_management(valid_raw()))
+            access=root/"config.json"; access.write_text(json.dumps({
+                "dmPolicy":"allowlist","allowFrom":["123456789012345678"],
+                "channels":{"223456789012345678":{"name":"Old room","requireMention":True,"allowFrom":["123456789012345678"],"allowBotMention":False,"allowBotFrom":[]}},
+                "accessLabels":{"users":{"123456789012345678":"Owner"}},
+            }),encoding="utf-8")
+            server=admin_ui.create_server(managed,root/"bindings.local.json",{},"",0,0,access_config_path=access)
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start();base=f"http://127.0.0.1:{server.server_port}"
+            try:
+                state=json.loads(request.urlopen(base+"/api/state").read())
+                self.assertEqual(state["accessPolicy"]["users"][0]["label"],"Owner")
+                candidate={"dmPolicy":"disabled","users":[{"userId":"123456789012345678","label":"Primary"}],"channels":[{"channelId":"223456789012345678","label":"New room","requireMention":True,"allowedUserIds":["123456789012345678"]}]}
+                req=request.Request(base+"/api/save-access",data=json.dumps(candidate).encode(),method="POST",headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token})
+                self.assertEqual(json.loads(request.urlopen(req).read()),{"saved":True})
+                saved=json.loads(access.read_text(encoding="utf-8"))
+                self.assertEqual(saved["channels"]["223456789012345678"]["name"],"New room")
+                self.assertEqual(saved["accessLabels"]["users"]["123456789012345678"],"Primary")
+            finally:
+                server.shutdown();server.server_close();thread.join(2)
+
     def test_valid_config_and_redaction(self):
         value=parse_agent_management(valid_raw())
         redacted=value.redacted()
         self.assertTrue(redacted["senders"][0]["tokenConfigured"])
         self.assertNotIn("token", redacted["senders"][0])
+        self.assertEqual(redacted["agents"][0]["model"], "gpt-test")
 
     def test_validation_rejects_duplicate_invalid_and_unknown_fields(self):
         cases=[]
@@ -72,9 +100,13 @@ class AgentManagementTests(unittest.TestCase):
         raw=valid_raw(); raw["agents"][0]["adapter"]="other"; cases.append((raw,"adapter"))
         raw=valid_raw(); raw["agents"][0]["senderId"]="missing"; cases.append((raw,"找不到"))
         raw=valid_raw(); raw["senders"].append(dict(raw["senders"][0])); cases.append((raw,"重複"))
+        raw=valid_raw(); raw["senders"].append({"senderId":"other","label":"Other","botUserId":"323456789012345678","token":"other-token","enabled":True}); cases.append((raw,"Discord Bot User ID"))
         raw=valid_raw(); raw["senders"][0]["botUserId"]="bad"; cases.append((raw,"格式"))
         raw=valid_raw(); raw["senders"][0]["token"]=""; cases.append((raw,"Token"))
+        raw=valid_raw(); raw["agents"][0]["mentionId"]="423456789012345678"; cases.append((raw,"mentionId"))
+        raw=valid_raw(); raw["senders"][0]["enabled"]=False; raw["agents"][0]["enabled"]=True; cases.append((raw,"啟用的 Sender"))
         raw=valid_raw(); raw["agents"][0]["budgetChars"]=0; cases.append((raw,"正整數"))
+        raw=valid_raw(); raw["agents"][0]["model"]="bad\nmodel"; cases.append((raw,"單行字串"))
         for candidate, expected in cases:
             with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
                 parse_agent_management(candidate)
@@ -184,7 +216,7 @@ class AgentManagementTests(unittest.TestCase):
             self.assertEqual(channel.sent,["Agent A: canonical","Agent B: canonical"])
             self.assertEqual(raw_text,"canonical")
 
-            dedicated=valid_raw(); dedicated["senders"].append({"senderId":"only-b","label":"B","botUserId":"423456789012345678","token":"test-b","enabled":True}); dedicated["agents"][1]["senderId"]="only-b"
+            dedicated=valid_raw(); dedicated["senders"].append({"senderId":"only-b","label":"B","botUserId":"423456789012345678","token":"test-b","enabled":True}); dedicated["agents"][1]["senderId"]="only-b"; dedicated["agents"][1]["mentionId"]="423456789012345678"
             value=parse_agent_management(dedicated); a,b=FakeChannel(),FakeChannel(); routed=DiscordSenderDelivery(value); routed.register_sender("shared",FakeClient(a));routed.register_sender("only-b",FakeClient(b));routed.register_room("room",1)
             await routed.deliver("room","a","one","r1");await routed.deliver("room","b","two","r2")
             self.assertEqual(a.sent,["one"]);self.assertEqual(b.sent,["two"])
@@ -211,12 +243,17 @@ class AgentManagementTests(unittest.TestCase):
     def test_admin_api_masks_token_enforces_origin_and_has_no_binding_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); config=root/"agent-management.local.json"; save_agent_management(config,parse_agent_management(valid_raw()))
-            server=admin_ui.create_server(config,root/"missing-bindings.json",{},"",0,0)
+            server=admin_ui.create_server(
+                config, root/"missing-bindings.json", {}, "", 0, 0,
+                codex_models=("gpt-test", "gpt-other"), default_codex_model="gpt-test",
+            )
             thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
             base=f"http://127.0.0.1:{server.server_port}"
             try:
                 state=json.loads(request.urlopen(base+"/api/state").read())
                 self.assertNotIn("token",state["senders"][0])
+                self.assertEqual(state["codexModels"],["gpt-test","gpt-other"])
+                self.assertEqual(state["defaultCodexModel"],"gpt-test")
                 body=json.dumps(valid_raw()).encode()
                 bad=request.Request(base+"/api/save",data=body,method="POST",headers={"Content-Type":"application/json"})
                 with self.assertRaises(error.HTTPError) as caught: request.urlopen(bad)
@@ -227,10 +264,24 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertIn("removeAgent",admin_ui.HTML)
                 self.assertIn("removeSender",admin_ui.HTML)
                 self.assertNotIn('data-k="available"',admin_ui.HTML)
-                self.assertNotIn('data-k="mentionId"',admin_ui.HTML)
+                self.assertIn('data-k="mentionId"',admin_ui.HTML)
+                self.assertIn("入口 Bot",admin_ui.HTML)
                 self.assertIn('data-k="agentAlias"',admin_ui.HTML)
                 self.assertIn("一般 human-turn 不使用這兩項額度",admin_ui.HTML)
+                self.assertIn("Discord 授權使用者",admin_ui.HTML)
+                self.assertIn("Discord 授權頻道",admin_ui.HTML)
+                self.assertIn("建立模型",admin_ui.HTML)
+                self.assertIn("目前不可用",admin_ui.HTML)
+                self.assertIn("由既有 Conversation／Project 決定",admin_ui.HTML)
+                self.assertIn("搬移全部 Agent",admin_ui.HTML)
                 self.assertIn("white-space:nowrap",admin_ui.HTML)
+                self.assertIn("Control plane 是",admin_ui.HTML)
+                self.assertIn("既有 Antigravity Conversation ID",admin_ui.HTML)
+                self.assertIn("Antigravity 目前只支援綁定既有 Conversation",admin_ui.HTML)
+                self.assertIn("為授權頻道建立 Binding",admin_ui.HTML)
+                self.assertIn("不會製造人類訊息、不會呼叫模型",admin_ui.HTML)
+                self.assertIn("detached Binding",admin_ui.HTML)
+                self.assertIn("#binding-management>section",admin_ui.HTML)
                 state["agents"][0]["displayName"]="Updated Agent"
                 state["senders"][0]["token"]=""
                 saved=request.Request(
@@ -248,9 +299,12 @@ class AgentManagementTests(unittest.TestCase):
     def test_admin_binding_action_requires_runtime_and_uses_bot_loop(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); config=root/"agent-management.local.json"; save_agent_management(config,parse_agent_management(valid_raw()))
+            access=root/"config.json"; access.write_text(json.dumps({
+                "channels":{"other":{"name":"Other","allowFrom":[]}}
+            }),encoding="utf-8")
             loop=asyncio.new_event_loop(); loop_thread=threading.Thread(target=loop.run_forever,daemon=True);loop_thread.start()
             admin=FakeBindingAdmin()
-            server=admin_ui.create_server(config,root/"missing-bindings.json",{},"",0,0,binding_admin=admin,event_loop=loop)
+            server=admin_ui.create_server(config,root/"missing-bindings.json",{},"",0,0,binding_admin=admin,event_loop=loop,access_config_path=access)
             thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start();base=f"http://127.0.0.1:{server.server_port}"
             try:
                 state=json.loads(request.urlopen(base+"/api/state").read())
@@ -261,6 +315,9 @@ class AgentManagementTests(unittest.TestCase):
                 for path, payload in [
                     ("bind-existing", {"roomId":"room","agentId":"a","nativeReference":"existing"}),
                     ("create", {"roomId":"room","agentId":"a"}),
+                    ("direct-bind-existing", {"roomId":"other","agentId":"a","nativeReference":"direct-existing"}),
+                    ("direct-create", {"roomId":"other","agentId":"a"}),
+                    ("move-room", {"sourceRoomId":"room","targetRoomId":"other"}),
                 ]:
                     req=request.Request(base+f"/api/bindings/{path}",data=json.dumps(payload).encode(),method="POST",headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token})
                     self.assertEqual(json.loads(request.urlopen(req).read()),{"ok":True})
@@ -268,7 +325,18 @@ class AgentManagementTests(unittest.TestCase):
                     ("cancel","room","a"),
                     ("bind-existing","room","a","existing"),
                     ("create","room","a"),
+                    ("direct-bind-existing","other","a","direct-existing"),
+                    ("direct-create","other","a"),
+                    ("move-room","room","other"),
                 ])
+                denied=request.Request(base+"/api/bindings/move-room",data=json.dumps({"sourceRoomId":"room","targetRoomId":"unknown"}).encode(),method="POST",headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token})
+                with self.assertRaises(error.HTTPError) as caught: request.urlopen(denied)
+                self.assertEqual(caught.exception.code,400)
+                self.assertEqual(admin.calls[-1],("move-room","room","other"))
+                denied=request.Request(base+"/api/bindings/direct-create",data=json.dumps({"roomId":"unknown","agentId":"a"}).encode(),method="POST",headers={"Content-Type":"application/json","Origin":f"http://localhost:{server.server_port}","X-CSRF-Token":server.csrf_token})
+                with self.assertRaises(error.HTTPError) as caught: request.urlopen(denied)
+                self.assertEqual(caught.exception.code,400)
+                self.assertEqual(admin.calls[-1],("move-room","room","other"))
             finally:
                 server.shutdown();server.server_close();thread.join(2);loop.call_soon_threadsafe(loop.stop);loop_thread.join(2);loop.close()
 

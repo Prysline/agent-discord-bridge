@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agent_bridge import ConversationPolicy, Participant
 from agent_bridge.discord_delivery import DiscordRoomDelivery
-from agent_bridge.orchestrator import BindingSnapshot, SharedOrchestrator
+from agent_bridge.orchestrator import BindingSnapshot, CoreOutcome, SharedOrchestrator
 from agent_bridge.root_shared import RootSharedHumanTurn, safe_failure_message
 from codex_adapter.root_composition import (
     compose_existing_codex_root,
@@ -113,7 +113,8 @@ def runtime(adapter=None, delivery=None, bindings=None):
         delivery=delivery,
         request_id_factory=lambda: "request-1",
     )
-    return RootSharedHumanTurn(core, "agent-a"), adapter, delivery
+    participants = [Participant("agent-a", "999", 1, 1, agent_alias="agent-a")]
+    return RootSharedHumanTurn(core, "agent-a", participants), adapter, delivery
 
 
 def discussion_runtime(*, delivery=None, bindings=None, adapters=None, maximum=3):
@@ -142,11 +143,57 @@ def discussion_runtime(*, delivery=None, bindings=None, adapters=None, maximum=3
 
 
 class RootSharedHumanTurnTests(unittest.TestCase):
+    def test_unsupported_codex_model_has_actionable_safe_message(self):
+        message = safe_failure_message(
+            (
+                CoreOutcome(
+                    "adapter-error",
+                    "request-placeholder",
+                    "agent-a",
+                    "codex_model_not_supported_for_chatgpt_account",
+                ),
+            )
+        )
+
+        self.assertIn("模型不支援", message)
+        self.assertIn("建立新的 Codex Thread", message)
+
     def test_single_agent_bot_routes_directly_and_strips_ingress_mention(self):
         bridge, _, _ = runtime()
         selected = bridge.select_human_target("<@999> hello", 999)
         self.assertTrue(selected.accepted)
         self.assertEqual((selected.agent_id, selected.text), ("agent-a", "hello"))
+
+    def test_dedicated_bot_routes_only_its_mapped_agent(self):
+        bridge, _, _ = discussion_runtime()
+        bridge = RootSharedHumanTurn(
+            bridge.core,
+            "agent-a",
+            [
+                Participant("agent-a", "101", 10, 1, agent_alias="planner"),
+                Participant("agent-b", "202", 10, 1, agent_alias="coder"),
+            ],
+        )
+        selected = bridge.select_human_target("請 <@202> 回覆", 202)
+        self.assertEqual((selected.accepted, selected.agent_id, selected.text), (True, "agent-b", "請  回覆"))
+        self.assertFalse(bridge.select_human_target("<@303> hello", 303).accepted)
+
+    def test_shared_bot_alias_scope_excludes_other_bot_agents(self):
+        bridge, _, _ = discussion_runtime()
+        bridge = RootSharedHumanTurn(
+            bridge.core,
+            "agent-a",
+            [
+                Participant("agent-a", "101", 10, 1, agent_alias="planner"),
+                Participant("agent-b", "101", 10, 1, agent_alias="coder"),
+                Participant("agent-c", "202", 10, 1, agent_alias="reviewer"),
+            ],
+        )
+        selected = bridge.select_human_target("<@101> coder: inspect", 101)
+        self.assertEqual((selected.accepted, selected.agent_id), (True, "agent-b"))
+        rejected = bridge.select_human_target("<@101> reviewer: inspect", 101)
+        self.assertFalse(rejected.accepted)
+        self.assertNotIn("reviewer", rejected.hint)
 
     def test_reply_ingress_preserves_single_and_shared_agent_routing(self):
         single, _, _ = runtime()
@@ -154,9 +201,9 @@ class RootSharedHumanTurnTests(unittest.TestCase):
         self.assertEqual((selected.accepted, selected.agent_id, selected.text), (True, "agent-a", "reply body"))
 
         shared, _, _ = discussion_runtime()
-        selected = shared.select_human_target("coder: reply body", 999, allow_without_mention=True)
+        selected = shared.select_human_target("reply body", 202, allow_without_mention=True)
         self.assertEqual((selected.accepted, selected.agent_id, selected.text), (True, "agent-b", "reply body"))
-        self.assertFalse(shared.select_human_target("reply body", 999, allow_without_mention=True).accepted)
+        self.assertTrue(shared.select_human_target("reply body", 202, allow_without_mention=True).accepted)
 
     def test_disabled_and_unavailable_agents_cannot_be_selected(self):
         base, _, _ = discussion_runtime()
@@ -176,18 +223,22 @@ class RootSharedHumanTurnTests(unittest.TestCase):
 
     def test_shared_bot_requires_exact_alias_and_strips_only_selector(self):
         bridge, _, _ = discussion_runtime()
-        selected = bridge.select_human_target("<@999> coder: 請評論 planner: hello", 999)
+        selected = bridge.select_human_target("<@202> 請評論 planner: hello", 202)
         self.assertTrue(selected.accepted)
         self.assertEqual((selected.agent_id, selected.text), ("agent-b", "請評論 planner: hello"))
+        shared = RootSharedHumanTurn(bridge.core, "agent-a", [
+            Participant("agent-a", "999", 10, 1, agent_alias="planner"),
+            Participant("agent-b", "999", 10, 1, agent_alias="coder"),
+        ])
         for text in ("<@999> hello", "<@999> missing: hello"):
-            rejected = bridge.select_human_target(text, 999)
+            rejected = shared.select_human_target(text, 999)
             self.assertFalse(rejected.accepted)
             self.assertIn("planner", rejected.hint)
             self.assertIn("coder", rejected.hint)
 
     def test_shared_bot_selected_agent_receives_stripped_canonical_text(self):
         bridge, adapters, _ = discussion_runtime()
-        selected = bridge.select_human_target("<@999> coder: inspect this", 999)
+        selected = bridge.select_human_target("<@202> inspect this", 202)
         result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text=selected.text, mentions_agent=True, target_agent_id=selected.agent_id))
         self.assertEqual(result.outcomes[0].action, "delivered")
         self.assertFalse(adapters["agent-a"].requests)
@@ -196,7 +247,7 @@ class RootSharedHumanTurnTests(unittest.TestCase):
 
     def test_selected_prompt_cannot_be_reclassified_as_control(self):
         bridge, adapters, _ = discussion_runtime()
-        selected = bridge.select_human_target("<@999> planner: !stop", 999)
+        selected = bridge.select_human_target("<@101> !stop", 101)
         result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text=selected.text, mentions_agent=True, target_agent_id=selected.agent_id))
         self.assertEqual(result.action, "handled")
         self.assertEqual(bridge.core.policy.state("room-1").phase, "idle")

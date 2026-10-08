@@ -69,13 +69,14 @@ class RootSharedHumanTurn:
             if not allow_without_mention:
                 return HumanTarget(False, hint="請先 mention 這個 Bot。")
             body = text.strip()
-        if not self._enabled:
-            return HumanTarget(False, hint="目前沒有啟用的 Agent。")
-        if len(self._enabled) == 1:
-            if not self._enabled[0].available:
+        candidates = [item for item in self._enabled if item.mention_id == str(bot_user_id)]
+        if not candidates:
+            return HumanTarget(False, hint="這個 Bot 沒有對應的啟用 Agent。")
+        if len(candidates) == 1:
+            if not candidates[0].available:
                 return HumanTarget(False, hint="這個 Agent 暫時不可用。")
-            return HumanTarget(bool(body), body, self._enabled[0].agent_id, "訊息內容不可為空。")
-        aliases = {item.agent_alias or item.agent_id: item for item in self._enabled}
+            return HumanTarget(bool(body), body, candidates[0].agent_id, "訊息內容不可為空。")
+        aliases = {item.agent_alias or item.agent_id: item for item in candidates}
         selector = re.match(r"^([a-z][a-z0-9_-]{0,31})\s*:\s*(.+)$", body, re.DOTALL)
         if selector and selector.group(1) in aliases:
             participant = aliases[selector.group(1)]
@@ -87,10 +88,10 @@ class RootSharedHumanTurn:
 
     @staticmethod
     def strip_ingress_mention(text: str, bot_user_id: int) -> str | None:
-        match = re.match(rf"^\s*<@!?{bot_user_id}>\s*", text)
+        match = re.search(rf"<@!?{bot_user_id}>", text)
         if match is None:
             return None
-        return text[match.end():].strip()
+        return (text[:match.start()] + text[match.end():]).strip()
 
     async def handle(
         self,
@@ -103,6 +104,7 @@ class RootSharedHumanTurn:
         text: str,
         mentions_agent: bool,
         target_agent_id: str | None = None,
+        mentioned_agent_ids: tuple[str, ...] = (),
         timestamp: str | None = None,
     ) -> RootHumanTurnResult:
         if not allowed:
@@ -124,6 +126,20 @@ class RootSharedHumanTurn:
             return RootHumanTurnResult(outcome.action, (outcome,))
 
         selected_agent = target_agent_id or self.agent_id
+        if self.core.policy.state(room_id).phase in {"active", "closing-check"}:
+            outcome = self.core.ingest_human(
+                room_id,
+                author_id=author_id,
+                display_name=display_name,
+                text=text,
+                mentioned_agents=(
+                    mentioned_agent_ids
+                    or ((selected_agent,) if mentions_agent else ())
+                ),
+                timestamp=timestamp,
+                allow_control=False,
+            )
+            return RootHumanTurnResult("discussion-context", (outcome,))
         key = (room_id, selected_agent)
         if self.core.binding(room_id, selected_agent) is None:
             if key in self._onboarding:
@@ -153,8 +169,6 @@ class RootSharedHumanTurn:
             timestamp=timestamp,
             allow_control=target_agent_id is None,
         )
-        if self.core.policy.state(room_id).phase in {"active", "closing-check"}:
-            return RootHumanTurnResult("discussion-context", (outcome,))
         outcomes = await self.core.run_human_turn(room_id, (selected_agent,))
         return RootHumanTurnResult("handled", tuple(outcomes))
 
@@ -189,4 +203,9 @@ def safe_failure_message(outcomes: tuple[CoreOutcome, ...]) -> str | None:
         return "回覆傳送結果目前無法確認，為避免重複送出，我先停止後續處理。"
     if action == "suspended":
         return "回覆無法送到這個頻道，這次沒有改用其他方式重送。"
+    if (
+        action == "adapter-error"
+        and outcomes[-1].reason == "codex_model_not_supported_for_chatgpt_account"
+    ):
+        return "設定的 Codex 模型不支援目前登入的 ChatGPT 帳號。請在本機 Agent 管理前台改選模型，重新啟動 Bot，並為頻道建立新的 Codex Thread。"
     return "後台這次沒有完成回覆，且不會改走舊流程重試。"

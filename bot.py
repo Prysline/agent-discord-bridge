@@ -25,8 +25,14 @@ from agent_bridge.agent_management import load_agent_management
 from agent_bridge.admin_ui import create_server as create_admin_server
 from agent_bridge.binding_operations import BindingAdminControl, BindingOperations
 from agent_bridge.discord_delivery import DiscordSenderDelivery
+from agent_bridge.discord_reply_routing import (
+    ManagedBotReplyIndex,
+    resolve_human_ingress_route,
+    system_message,
+)
 from agent_bridge.heterogeneous_composition import compose_existing_heterogeneous_root
 from agent_bridge.root_shared import safe_failure_message
+from antigravity_adapter.control_plane import AntigravityControlPlane
 from antigravity_adapter.transport import SidecarHttpClient
 from codex_adapter.app_server import (
     CodexAppServerClient as SharedCodexAppServerClient,
@@ -54,7 +60,7 @@ load_dotenv(BOT_DIR / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 BOT_USER_ID = int(os.getenv("BOT_USER_ID", "0"))
 CODEX_PATH = os.getenv("CODEX_PATH", "codex")
-CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.6-sol")
+CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.4")
 CODEX_CWD_RAW = Path(os.getenv("CODEX_CWD", "shared_workspace"))
 CODEX_CWD = (CODEX_CWD_RAW if CODEX_CWD_RAW.is_absolute() else BOT_DIR / CODEX_CWD_RAW).resolve()
 CODEX_TURN_TIMEOUT_SEC = int(os.getenv("CODEX_TURN_TIMEOUT_SEC", "0") or "0")
@@ -84,7 +90,12 @@ ANTIGRAVITY_RENDEZVOUS_PATH = (
     if ANTIGRAVITY_RENDEZVOUS_PATH_RAW.is_absolute()
     else BOT_DIR / ANTIGRAVITY_RENDEZVOUS_PATH_RAW
 ).resolve()
-BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "AI Companion").strip() or "AI Companion"
+ROOT_BOT_LABEL = os.getenv("ROOT_BOT_LABEL", "Discord Bridge").strip() or "Discord Bridge"
+LEGACY_AGENT_DISPLAY_NAME = (
+    os.getenv("LEGACY_AGENT_DISPLAY_NAME")
+    or os.getenv("BOT_DISPLAY_NAME")  # Deprecated compatibility for existing .env files.
+    or "AI Companion"
+).strip() or "AI Companion"
 PERSONA_PATH_RAW = Path(os.getenv("BOT_PERSONA_PATH", "persona.md"))
 PERSONA_PATH = (
     PERSONA_PATH_RAW if PERSONA_PATH_RAW.is_absolute() else BOT_DIR / PERSONA_PATH_RAW
@@ -115,29 +126,43 @@ log = logging.getLogger("codex-discord-bot")
 
 # ── Access Control ────────────────────────────────────
 
-recent_bot_messages: set[int] = set()
 MAX_RECENT = 200
 peer_turn_limiter = PeerTurnLimiter(MAX_PEER_TURNS)
+MANAGED_BOT_IDS = {
+    int(sender.bot_user_id) for sender in AGENT_MANAGEMENT.senders
+} | {BOT_USER_ID}
+AGENTS_BY_MENTION_ID: dict[int, tuple[str, ...]] = {}
+for managed_agent in AGENT_MANAGEMENT.agents:
+    if managed_agent.enabled:
+        mention_id = int(managed_agent.mention_id)
+        AGENTS_BY_MENTION_ID[mention_id] = (
+            *AGENTS_BY_MENTION_ID.get(mention_id, ()), managed_agent.agent_id
+        )
+recent_bot_messages = ManagedBotReplyIndex(MANAGED_BOT_IDS, MAX_RECENT)
 
 
-def remember_bot_message(message_id: int) -> None:
-    recent_bot_messages.add(message_id)
-    while len(recent_bot_messages) > MAX_RECENT:
-        recent_bot_messages.pop()
+def remember_bot_message(message_id: int, bot_user_id: int = BOT_USER_ID) -> None:
+    recent_bot_messages.remember(message_id, bot_user_id)
 
 
-def replies_to_root_bot(message: discord.Message) -> bool:
-    replies_to_bot = False
-    if message.reference and message.reference.message_id:
-        replies_to_bot = message.reference.message_id in recent_bot_messages
-        if message.reference.resolved and hasattr(message.reference.resolved, "author"):
-            replies_to_bot = replies_to_bot or message.reference.resolved.author.id == BOT_USER_ID
-    return replies_to_bot
+def replies_to_managed_bot(message: discord.Message) -> bool:
+    return replied_managed_bot_id(message) is not None
+
+
+def replied_managed_bot_id(message: discord.Message) -> int | None:
+    if not message.reference:
+        return None
+    resolved_author_id = None
+    if message.reference.resolved and hasattr(message.reference.resolved, "author"):
+        resolved_author_id = int(message.reference.resolved.author.id)
+    return recent_bot_messages.resolve(
+        message.reference.message_id, resolved_author_id
+    )
 
 
 def access_decision(message: discord.Message) -> AccessDecision:
     """套用 fail-closed allowlist 與 mention 規則。"""
-    replies_to_bot = replies_to_root_bot(message)
+    replies_to_bot = replies_to_managed_bot(message)
 
     return decide_access(
         CONFIG,
@@ -147,7 +172,7 @@ def access_decision(message: discord.Message) -> AccessDecision:
             bot_user_id=str(BOT_USER_ID),
             channel_id=str(getattr(message.channel, "id", 0)),
             is_dm=isinstance(message.channel, discord.DMChannel),
-            mentions_bot=any(u.id == BOT_USER_ID for u in message.mentions),
+            mentions_bot=any(u.id in MANAGED_BOT_IDS for u in message.mentions),
             replies_to_bot=replies_to_bot,
             is_control_command=(
                 SHARED_CORE_ENABLED
@@ -210,7 +235,7 @@ async def build_prompt(message: discord.Message) -> str:
 {context}
 </discord_history>
 
-請以{BOT_DISPLAY_NAME}自己的身分回覆最新一則訊息。若內容涉及無法確認的事實，請指出不確定性或詢問，不要補寫成已知事實。"""
+請以{LEGACY_AGENT_DISPLAY_NAME}自己的身分回覆最新一則訊息。若內容涉及無法確認的事實，請指出不確定性或詢問，不要補寫成已知事實。"""
 
 
 # ── Thread Map ────────────────────────────────────────
@@ -913,6 +938,7 @@ codex_client = CodexAppServerClient(
 
 shared_delivery: DiscordSenderDelivery | None = None
 shared_app_client: SharedCodexAppServerClient | None = None
+shared_antigravity_client: SidecarHttpClient | None = None
 shared_root = None
 shared_admin_server = None
 shared_admin_thread: threading.Thread | None = None
@@ -938,12 +964,13 @@ if SHARED_CORE_ENABLED:
         for item in AGENT_MANAGEMENT.agents
     ]
     shared_discussion = parse_root_discussion_settings(managed_config)
+    shared_antigravity_client = SidecarHttpClient(ANTIGRAVITY_RENDEZVOUS_PATH)
     shared_root = compose_existing_heterogeneous_root(
         binding_path=SHARED_BINDINGS_PATH,
         primary_agent_id=SHARED_AGENT_ID,
         adapter_types=shared_discussion.adapter_types,
         codex_client=shared_app_client,
-        antigravity_transport=SidecarHttpClient(ANTIGRAVITY_RENDEZVOUS_PATH),
+        antigravity_transport=shared_antigravity_client,
         delivery=shared_delivery,
         participants=list(shared_discussion.participants),
         display_names=dict(shared_discussion.display_names),
@@ -1032,6 +1059,16 @@ if SHARED_CORE_ENABLED:
             shared_delivery.register_sender(sender.sender_id, client)
         else:
             sender_client = discord.Client(intents=discord.Intents.none())
+            sender_label = sender.label
+            sender_id = sender.sender_id
+
+            @sender_client.event
+            async def on_ready(sender_client=sender_client, sender_label=sender_label, sender_id=sender_id):
+                log.info(
+                    "Discord Send-only Sender 已上線: label=%s sender_id=%s account=%s (ID: %s)",
+                    sender_label, sender_id, sender_client.user, sender_client.user.id,
+                )
+
             sender_clients[sender.sender_id] = sender_client
             shared_delivery.register_sender(sender.sender_id, sender_client)
 
@@ -1063,7 +1100,7 @@ async def drive_shared_discussion(room_id: str, channel) -> None:
             return
         final = outcomes[-1]
         if final.action == "completed":
-            await channel.send("討論已完成。")
+            await channel.send(system_message("討論已完成。"))
         elif final.action in {
             "binding-unavailable",
             "context-unknown",
@@ -1073,7 +1110,7 @@ async def drive_shared_discussion(room_id: str, channel) -> None:
             "adapter-error",
             "suspended",
         }:
-            await channel.send("討論已暫停，這次不會改走舊流程重試。")
+            await channel.send(system_message("討論已暫停，這次不會改走舊流程重試。"))
     except Exception:
         log.exception("shared bounded discussion 發生未預期錯誤")
     finally:
@@ -1110,7 +1147,7 @@ async def send_backend_failure_reply(message: discord.Message, error_message: st
         reply_text += f"\n\n附註：{detail}"
 
     try:
-        sent = await message.reply(reply_text, mention_author=False)
+        sent = await message.reply(system_message(reply_text), mention_author=False)
         remember_bot_message(sent.id)
     except Exception as exc:
         log.warning(f"補發 fallback 回覆失敗: {exc}")
@@ -1197,7 +1234,13 @@ async def send_codex_reply(message: discord.Message, text: str | None) -> bool:
 @client.event
 async def on_ready():
     global shared_admin_server, shared_admin_thread
-    log.info(f"{BOT_DISPLAY_NAME} Listener Bot 已上線: {client.user} (ID: {client.user.id})")
+    log.info("Discord Root Listener 已上線: label=%s account=%s (ID: %s)", ROOT_BOT_LABEL, client.user, client.user.id)
+    for sender in AGENT_MANAGEMENT.senders:
+        if sender.enabled and sender.sender_id not in sender_clients:
+            log.info(
+                "Discord Sender 已連結至 Root Listener: label=%s sender_id=%s account=%s (ID: %s)",
+                sender.label, sender.sender_id, client.user, client.user.id,
+            )
     try:
         for sender in AGENT_MANAGEMENT.senders:
             sender_client = sender_clients.get(sender.sender_id)
@@ -1213,30 +1256,51 @@ async def on_ready():
         if SHARED_CORE_ENABLED:
             assert shared_app_client is not None
             await shared_app_client.connect()
+            try:
+                available_codex_models = await shared_app_client.list_models()
+            except Exception as exc:
+                available_codex_models = ()
+                log.warning("無法讀取 Codex 可用模型；建立 Thread 時將交由 Codex 驗證: %s", exc)
             if shared_admin_server is None:
                 assert shared_root is not None
                 native_controls = {}
+                managed_agents = {item.agent_id: item for item in AGENT_MANAGEMENT.agents}
                 for agent_id, adapter_type in shared_discussion.adapter_types.items():
-                    if adapter_type != "codex":
-                        continue
                     adapter = shared_root.core.adapters[agent_id]
-                    native_controls[agent_id] = CodexControlPlane(
-                        shared_app_client,
-                        cwd=CODEX_CWD,
-                        model=CODEX_MODEL,
-                        base_instructions=PERSONA_INSTRUCTIONS,
-                        resolver=adapter.binding_resolver,
-                    )
+                    if adapter_type == "codex":
+                        configured_model = managed_agents[agent_id].model or CODEX_MODEL
+                        native_controls[agent_id] = CodexControlPlane(
+                            shared_app_client,
+                            cwd=CODEX_CWD,
+                            model=configured_model,
+                            base_instructions=PERSONA_INSTRUCTIONS,
+                            resolver=adapter.binding_resolver,
+                            available_models=available_codex_models,
+                        )
+                    elif adapter_type == "antigravity":
+                        assert shared_antigravity_client is not None
+                        native_controls[agent_id] = AntigravityControlPlane(
+                            shared_antigravity_client,
+                            adapter.binding_resolver,
+                        )
                 admin = BindingAdminControl(
                     BindingOperations(SHARED_BINDINGS_PATH, shared_root),
                     adapter_types=shared_discussion.adapter_types,
                     display_names=shared_discussion.display_names,
                     native_controls=native_controls,
+                    enabled_agents={
+                        item.agent_id
+                        for item in AGENT_MANAGEMENT.agents
+                        if item.enabled
+                    },
                 )
                 shared_admin_server = create_admin_server(
                     AGENT_MANAGEMENT_PATH, SHARED_BINDINGS_PATH, CONFIG,
                     TOKEN or "", BOT_USER_ID, AGENT_ADMIN_PORT,
                     binding_admin=admin, event_loop=asyncio.get_running_loop(),
+                    access_config_path=BOT_DIR / "config.json",
+                    codex_models=available_codex_models,
+                    default_codex_model=CODEX_MODEL,
                 )
                 shared_admin_thread = threading.Thread(
                     target=shared_admin_server.serve_forever,
@@ -1261,8 +1325,8 @@ async def on_disconnect():
 
 @client.event
 async def on_message(message: discord.Message):
-    if message.author.id == BOT_USER_ID:
-        remember_bot_message(message.id)
+    if message.author.id in MANAGED_BOT_IDS:
+        remember_bot_message(message.id, int(message.author.id))
         return
 
     decision = access_decision(message)
@@ -1284,35 +1348,56 @@ async def on_message(message: discord.Message):
                 and active_driver is not None
                 and not active_driver.done()
             ):
-                await message.channel.send("上一場討論仍在停止或收尾，請稍後重新發起。")
+                await message.channel.send(system_message("上一場討論仍在停止或收尾，請稍後重新發起。"))
                 await safe_add_reaction(message, "⚠️")
                 return
             await safe_add_reaction(message, "⏳")
             try:
                 target_agent_id = None
                 effective_text = message.content or ""
-                mentions_root = any(user.id == BOT_USER_ID for user in message.mentions)
-                allow_without_mention = not mentions_root
+                mentioned_bot_ids = tuple(dict.fromkeys(
+                    int(user.id) for user in message.mentions if user.id in MANAGED_BOT_IDS
+                ))
+                replied_bot_id = replied_managed_bot_id(message)
                 if control is None:
                     phase = shared_root.core.policy.state(room_id).phase
                     if phase in {"active", "closing-check"}:
-                        stripped = shared_root.strip_ingress_mention(effective_text, BOT_USER_ID)
-                        if stripped is None and allow_without_mention:
-                            stripped = effective_text.strip()
+                        stripped = effective_text
+                        for mentioned_bot_id in mentioned_bot_ids:
+                            updated = shared_root.strip_ingress_mention(stripped, mentioned_bot_id)
+                            if updated is not None:
+                                stripped = updated
                         if not stripped:
-                            await message.channel.send("請先 mention 這個 Bot，且訊息內容不可為空。")
+                            await message.channel.send(system_message("請先 mention 這個 Bot，且訊息內容不可為空。"))
                             await safe_add_reaction(message, "⚠️")
                             return
                         target_agent_id = shared_root.agent_id
                         effective_text = stripped
                     else:
+                        route = resolve_human_ingress_route(
+                            mentioned_bot_ids,
+                            has_reply=message.reference is not None,
+                            replied_bot_id=replied_bot_id,
+                            default_bot_id=BOT_USER_ID,
+                        )
+                        if route.failure == "multiple_mentions":
+                            await message.channel.send(system_message("一般訊息一次只能指定一個 Bot；多 Agent 討論請使用 !discuss。"))
+                            await safe_add_reaction(message, "⚠️")
+                            return
+                        if route.failure == "unresolved_reply":
+                            await message.channel.send(system_message(
+                                "無法確認你回覆的是哪個 Bot；請直接 mention 要使用的 Bot。"
+                            ))
+                            await safe_add_reaction(message, "⚠️")
+                            return
+                        assert route.target_bot_id is not None
                         selected = shared_root.select_human_target(
                             effective_text,
-                            BOT_USER_ID,
-                            allow_without_mention=allow_without_mention,
+                            route.target_bot_id,
+                            allow_without_mention=route.allow_without_mention,
                         )
                         if not selected.accepted:
-                            await message.channel.send(selected.hint)
+                            await message.channel.send(system_message(selected.hint))
                             await safe_add_reaction(message, "⚠️")
                             return
                         target_agent_id = selected.agent_id
@@ -1325,8 +1410,13 @@ async def on_message(message: discord.Message):
                         author_id=str(message.author.id),
                         display_name=message.author.display_name or message.author.name,
                         text=effective_text,
-                        mentions_agent=mentions_root or allow_without_mention,
+                        mentions_agent=bool(mentioned_bot_ids) or replied_bot_id is not None,
                         target_agent_id=target_agent_id,
+                        mentioned_agent_ids=tuple(
+                            agent_id
+                            for bot_id in mentioned_bot_ids
+                            for agent_id in AGENTS_BY_MENTION_ID.get(bot_id, ())
+                        ),
                         timestamp=message.created_at.isoformat(),
                     )
             except Exception:
@@ -1346,29 +1436,37 @@ async def on_message(message: discord.Message):
                 await safe_add_reaction(message, "✅")
                 return
             if result is not None and result.action == "onboarding-required":
-                await message.channel.send(
+                await message.channel.send(system_message(
                     "這個 Agent 在此頻道還沒有設定聊天窗。\n"
                     "請到本機 Agent 管理前台建立新聊天窗或綁定既有聊天窗。"
-                )
+                ))
                 await safe_add_reaction(message, "⚠️")
                 return
             if result is not None and result.action == "onboarding-pending":
-                await message.channel.send(
+                await message.channel.send(system_message(
                     "這個 Agent 正在等待完成聊天窗綁定。請先到本機管理前台完成設定。"
-                )
+                ))
                 await safe_add_reaction(message, "⚠️")
                 return
             if result is not None and result.action == "rejected":
-                await message.channel.send("討論指令無效，或目前已有討論正在進行。")
+                await message.channel.send(system_message("討論指令無效，或目前已有討論正在進行。"))
                 await safe_add_reaction(message, "⚠️")
                 return
             failure = safe_failure_message(result.outcomes) if result is not None else "後台這次沒有完成回覆。"
+            if result is not None and failure is not None:
+                for outcome in result.outcomes:
+                    log.warning(
+                        "Shared Agent outcome: agent=%s action=%s reason=%s",
+                        outcome.agent_id or "-",
+                        outcome.action,
+                        outcome.reason or "-",
+                    )
             if failure is None:
                 await safe_add_reaction(message, "✅")
             else:
                 await safe_add_reaction(message, "⚠️")
                 try:
-                    await message.channel.send(failure)
+                    await message.channel.send(system_message(failure))
                 except Exception:
                     log.warning("shared failure indication 無法送達")
         return
@@ -1439,8 +1537,12 @@ def main():
         sys.exit(1)
 
     log.info(
-        f"啟動 {BOT_DISPLAY_NAME} Listener Bot... "
-        f"(transport={CODEX_TRANSPORT}, ws_url={CODEX_WS_URL if CODEX_TRANSPORT == 'ws' else 'n/a'})"
+        "啟動 Discord Root Listener... "
+        "label=%s enabled_senders=%s transport=%s ws_url=%s",
+        ROOT_BOT_LABEL,
+        sum(1 for sender in AGENT_MANAGEMENT.senders if sender.enabled),
+        CODEX_TRANSPORT,
+        CODEX_WS_URL if CODEX_TRANSPORT == "ws" else "n/a",
     )
     client.run(TOKEN, log_handler=None)
 

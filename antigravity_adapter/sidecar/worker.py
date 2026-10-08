@@ -157,6 +157,12 @@ class State:
             raise SidecarFailure("agentapi_failed")
         return value
 
+    def validate_conversation(self, conversation_id: str) -> None:
+        transcript_path = self._expected_transcript(conversation_id)
+        identity, _ = self._baseline(transcript_path)
+        if identity is None:
+            raise SidecarFailure("conversation_unavailable")
+
     def stop(self, payload: dict[str, Any]) -> str:
         with self.lock:
             if not self.pending_id:
@@ -371,6 +377,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized(): return
         try:
             body = self._body()
+            if self.path == "/validate-conversation":
+                conversation_id = body.get("conversationId")
+                if not isinstance(conversation_id, str) or not conversation_id.strip():
+                    raise ValueError
+                self.server.state.validate_conversation(conversation_id)
+                self._json(200, {"valid":True}); return
             if self.path == "/send":
                 conversation_id, message = body.get("conversationId"), body.get("message")
                 if not isinstance(conversation_id, str) or not conversation_id.strip() or not isinstance(message, str) or not message.strip():

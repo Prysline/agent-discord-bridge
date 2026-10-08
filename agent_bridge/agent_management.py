@@ -17,6 +17,7 @@ class ManagedAgent:
     display_name: str
     agent_alias: str
     adapter: str
+    model: str
     mention_id: str
     sender_id: str
     enabled: bool
@@ -66,6 +67,7 @@ class AgentManagement:
                     "displayName": item.display_name,
                     "agentAlias": item.agent_alias,
                     "adapter": item.adapter,
+                    "model": item.model,
                     "mentionId": item.mention_id,
                     "senderId": item.sender_id,
                     "enabled": item.enabled,
@@ -103,6 +105,7 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
         raw_senders = []
     senders: list[DiscordSender] = []
     sender_ids: set[str] = set()
+    bot_user_ids: set[str] = set()
     for index, value in enumerate(raw_senders):
         field = f"senders[{index}]"
         if not isinstance(value, Mapping):
@@ -119,10 +122,15 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
         if sender_id in sender_ids:
             errors.append(f"{field}.senderId: 重複的 Sender ID")
         sender_ids.add(sender_id)
+        if bot_user_id in bot_user_ids:
+            errors.append(f"{field}.botUserId: 重複的 Discord Bot User ID")
+        bot_user_ids.add(bot_user_id)
         if enabled and not token.strip():
             errors.append(f"{field}.token: 啟用的 Sender 必須設定 Token")
         senders.append(DiscordSender(sender_id, label, bot_user_id, token.strip(), enabled))
     agents: list[ManagedAgent] = []
+    senders_by_id = {item.sender_id: item for item in senders}
+    enabled_bot_user_ids = {item.bot_user_id for item in senders if item.enabled}
     agent_ids: set[str] = set()
     enabled_aliases: set[str] = set()
     for index, value in enumerate(raw_agents):
@@ -139,6 +147,11 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
         if adapter not in {"codex", "antigravity"}:
             errors.append(f"{field}.adapter: 必須是 codex 或 antigravity")
             adapter = ""
+        model = value.get("model", "")
+        if not isinstance(model, str) or "\n" in model or "\r" in model:
+            errors.append(f"{field}.model: 必須是單行字串")
+            model = ""
+        model = model.strip()
         mention_id = _snowflake(value.get("mentionId"), f"{field}.mentionId", errors)
         sender_id = _text(value.get("senderId"), f"{field}.senderId", errors)
         enabled = _bool(value.get("enabled", True), f"{field}.enabled", errors)
@@ -154,7 +167,11 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
             enabled_aliases.add(agent_alias)
         if sender_id not in sender_ids:
             errors.append(f"{field}.senderId: 找不到對應 Sender")
-        agents.append(ManagedAgent(agent_id, display_name, agent_alias, str(adapter), mention_id, sender_id, enabled, available, budget, calls))
+        elif enabled and not senders_by_id[sender_id].enabled:
+            errors.append(f"{field}.senderId: 啟用的 Agent 必須使用啟用的 Sender")
+        if enabled and mention_id not in enabled_bot_user_ids:
+            errors.append(f"{field}.mentionId: 必須對應啟用的 Discord Sender Bot User ID")
+        agents.append(ManagedAgent(agent_id, display_name, agent_alias, str(adapter), model, mention_id, sender_id, enabled, available, budget, calls))
     if errors:
         raise ValueError("\n".join(errors))
     return AgentManagement(tuple(agents), tuple(senders))
@@ -168,7 +185,7 @@ def load_agent_management(path: Path, legacy_config: Mapping[str, Any], token: s
         ManagedAgent(
             str(item["agentId"]), str(item.get("displayName", item["agentId"])),
             str(item.get("agentAlias", item["agentId"])),
-            str(item["adapter"]), str(item["mentionId"]), "legacy-default",
+            str(item["adapter"]), str(item.get("model", "")), str(item["mentionId"]), "legacy-default",
             bool(item.get("enabled", True)), bool(item.get("available", True)),
             int(item["budgetChars"]), int(item["maxCalls"]),
         )
@@ -192,6 +209,7 @@ def save_agent_management(path: Path, value: AgentManagement) -> None:
     payload = {
         "agents": [
             {"agentId": a.agent_id, "displayName": a.display_name, "agentAlias": a.agent_alias, "adapter": a.adapter,
+             "model": a.model,
              "mentionId": a.mention_id, "senderId": a.sender_id, "enabled": a.enabled,
              "available": a.available, "budgetChars": a.budget_chars, "maxCalls": a.max_calls}
             for a in value.agents

@@ -31,14 +31,17 @@ class CodexControlPlane:
         model: str,
         base_instructions: str,
         resolver: InMemoryBindingResolver,
+        available_models: tuple[str, ...] = (),
     ) -> None:
         self.client = client
         self.cwd = cwd
         self.model = model
         self.base_instructions = base_instructions
         self.resolver = resolver
+        self.available_models = available_models
         self.adapter = "codex"
         self.mapping_field = "codexBindings"
+        self.can_create = True
 
     async def validate_existing(self, thread_id: str) -> None:
         if not thread_id.strip():
@@ -49,6 +52,11 @@ class CodexControlPlane:
             raise ValueError("Codex thread could not be validated") from exc
 
     async def create(self) -> str:
+        if self.available_models and self.model not in self.available_models:
+            raise CodexCreateRejected(
+                f"Codex model '{self.model}' is unavailable; choose one of: "
+                + ", ".join(self.available_models)
+            )
         try:
             reference = await self.client.start_thread(
                 cwd=self.cwd,
