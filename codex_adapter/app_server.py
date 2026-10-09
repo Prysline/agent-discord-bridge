@@ -333,6 +333,14 @@ class CodexAppServerClient:
         self._loaded_threads.add(thread_id)
         return ThreadReference(thread_id)
 
+    async def set_thread_name(self, thread_id: str, name: str) -> None:
+        if not thread_id or not name.strip() or "\n" in name or "\r" in name:
+            raise ValueError("thread id and single-line name are required")
+        await self._request(
+            "thread/name/set",
+            {"threadId": thread_id, "name": name.strip()},
+        )
+
     async def start_turn(
         self,
         thread_id: str,

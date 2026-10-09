@@ -1301,6 +1301,11 @@ async def on_ready():
                         for item in AGENT_MANAGEMENT.agents
                         if item.enabled
                     },
+                    room_names={
+                        str(room_id): str(policy.get("name", room_id))
+                        for room_id, policy in CONFIG.get("channels", {}).items()
+                        if isinstance(policy, dict)
+                    },
                 )
                 shared_admin_server = create_admin_server(
                     AGENT_MANAGEMENT_PATH, SHARED_BINDINGS_PATH, CONFIG,

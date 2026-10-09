@@ -758,11 +758,13 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeControlClient:
-    def __init__(self, create_outcome=None, resume_outcome=None):
+    def __init__(self, create_outcome=None, resume_outcome=None, name_outcome=None):
         self.create_outcome = create_outcome or ThreadReference("new-thread")
         self.resume_outcome = resume_outcome
+        self.name_outcome = name_outcome
         self.create_calls = 0
         self.resume_calls = []
+        self.name_calls = []
 
     async def start_thread(self, **kwargs):
         self.create_calls += 1
@@ -775,6 +777,11 @@ class FakeControlClient:
         if isinstance(self.resume_outcome, Exception):
             raise self.resume_outcome
         return {"thread": {"id": thread_id}}
+
+    async def set_thread_name(self, thread_id, name):
+        self.name_calls.append((thread_id, name))
+        if isinstance(self.name_outcome, Exception):
+            raise self.name_outcome
 
 
 class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
@@ -833,6 +840,11 @@ class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
                 result = {"thread": {"id": "new-empty-thread"}}
             elif payload["method"] == "thread/resume":
                 result = {"thread": {"id": payload["params"]["threadId"]}}
+            elif payload["method"] == "thread/name/set":
+                self.assertEqual(payload["params"], {
+                    "threadId": "new-empty-thread", "name": "Support · Agent A",
+                })
+                result = {}
             else:
                 raise AssertionError(payload["method"])
             return {"id": payload["id"], "result": result}
@@ -843,9 +855,10 @@ class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         created = await client.start_thread(
             cwd=Path("workspace"), model="model", base_instructions="safe"
         )
+        await client.set_thread_name(created.thread_id, "Support · Agent A")
         await client.resume_thread(created.thread_id)
 
-        self.assertEqual(methods, ["initialize", "thread/start"])
+        self.assertEqual(methods, ["initialize", "thread/start", "thread/name/set"])
         await client.close()
 
     async def test_validate_existing_uses_resume_without_model_turn(self):
@@ -856,8 +869,16 @@ class AppServerAndControlPlaneTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmed_create_returns_native_reference_once(self):
         client = FakeControlClient()
-        self.assertEqual(await self.control(client).create(), "new-thread")
+        self.assertEqual(await self.control(client).create("Support · Agent A"), "new-thread")
         self.assertEqual(client.create_calls, 1)
+        self.assertEqual(client.name_calls, [("new-thread", "Support · Agent A")])
+
+    async def test_name_failure_keeps_confirmed_thread(self):
+        client = FakeControlClient(name_outcome=AppServerRpcError(-1, "name rejected"))
+        with self.assertLogs("codex_adapter.control_plane", level="WARNING"):
+            result = await self.control(client).create("Support · Agent A")
+        self.assertEqual(result, "new-thread")
+        self.assertEqual(client.name_calls, [("new-thread", "Support · Agent A")])
 
     async def test_unavailable_model_is_rejected_before_thread_creation(self):
         client = FakeControlClient()

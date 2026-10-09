@@ -270,7 +270,7 @@ Codex 檢查是否已建立 thread，再用「驗證並綁定」納管。
 | Discord Senders | 新增 Discord 發言帳號，設定 Sender ID、標籤、Bot User ID、Token 與啟用狀態。Token 已設定且 Sender ID 未變時可留白保留。 | 和 Agents 一起按「驗證並儲存」；重新啟動 Bot 後生效。 |
 | Discord 授權使用者 | 新增／移除具本機名稱的使用者，並設定 DM 規則。名稱只作辨識，權限仍依 numeric User ID。 | 和授權頻道一起按「儲存使用者／頻道設定」；重新啟動 Bot 後生效。 |
 | Discord 授權頻道 | 新增／移除頻道、選擇允許使用者及是否需要 mention。新增頻道不會同時建立 Agent 或 AI 聊天窗。 | 和授權使用者一起按「儲存使用者／頻道設定」；重新啟動 Bot 後生效。 |
-| 為授權頻道建立 Binding | 直接輸入已授權 Channel ID，為 Agent 綁定既有 native 聊天窗；Codex 也可建立新 Thread。此操作不會製造訊息或呼叫模型。 | 成功後立即更新 persistence 與目前 runtime，不需重啟。 |
+| 為授權頻道建立 Binding | 直接輸入已授權 Channel ID，為 Agent 綁定既有 native 聊天窗；Codex 也可建立新 Thread。Bridge 新建的 Codex Thread 會命名為「頻道名稱 · Agent 顯示名稱」；綁定既有 Thread 不會改名。此操作不會製造訊息或呼叫模型。 | 成功後立即更新 persistence 與目前 runtime，不需重啟。 |
 | 待完成的頻道綁定 | 連結已管理聊天窗、驗證並綁定既有 Codex Thread／Antigravity Conversation、建立新的 Codex Thread，或取消 pending。Antigravity 不支援從 Bridge 建立新 Conversation。 | 成功後立即更新 persistence 與目前 runtime，不需重啟。 |
 | Binding 管理 | 單獨搬移 Agent、把同頻道全部 active Agent 一起搬移，或解除頻道綁定。 | 成功後立即生效，不會刪除 Discord 頻道或 native AI 對話。 |
 

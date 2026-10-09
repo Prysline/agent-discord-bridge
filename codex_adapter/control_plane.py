@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from .app_server import (
+    AppServerError,
     AppServerMethodUnsupported,
     AppServerProtocolError,
     AppServerRpcError,
@@ -12,6 +14,9 @@ from .app_server import (
     CodexAppServerClient,
 )
 from .binding import InMemoryBindingResolver, ResolvedBinding
+
+
+log = logging.getLogger(__name__)
 
 
 class CodexCreateRejected(ValueError):
@@ -51,7 +56,7 @@ class CodexControlPlane:
         except Exception as exc:
             raise ValueError("Codex thread could not be validated") from exc
 
-    async def create(self) -> str:
+    async def create(self, name: str | None = None) -> str:
         if self.available_models and self.model not in self.available_models:
             raise CodexCreateRejected(
                 f"Codex model '{self.model}' is unavailable; choose one of: "
@@ -75,6 +80,14 @@ class CodexControlPlane:
             raise CodexCreateAmbiguous(
                 "Codex may have created a thread but returned an invalid response"
             ) from exc
+        if name:
+            try:
+                await self.client.set_thread_name(reference.thread_id, name)
+            except (AppServerError, ValueError) as exc:
+                log.warning(
+                    "Codex Thread 已建立，但自動命名失敗；保留 Thread 與 Binding: %s",
+                    type(exc).__name__,
+                )
         return reference.thread_id
 
     def find_mapping(self, raw: dict[str, object], native_reference: str) -> tuple[str, int] | None:

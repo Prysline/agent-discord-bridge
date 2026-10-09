@@ -47,8 +47,8 @@ class NativeControl:
         if self.validation_error is not None:
             raise self.validation_error
 
-    async def create(self):
-        self.calls.append(("create",))
+    async def create(self, name=None):
+        self.calls.append(("create", name))
         if isinstance(self.created, Exception):
             raise self.created
         return self.created
@@ -90,6 +90,7 @@ class BindingOperationsTests(unittest.TestCase):
             adapter_types={"a": "codex"},
             display_names={"a": "Agent A"},
             native_controls={"a": native} if native else {},
+            room_names={"new": "New room"},
             binding_id_factory=binding_id_factory,
         )
         return bridge, adapter, control
@@ -170,7 +171,7 @@ class BindingOperationsTests(unittest.TestCase):
 
             asyncio.run(control.create_pending("new", "a"))
 
-            self.assertEqual(native.calls[0], ("create",))
+            self.assertEqual(native.calls[0], ("create", "New room · Agent A"))
             self.assertEqual(len(adapter.requests), 1)
             self.assertEqual(native.published, [("logical-new", 1, "created-thread")])
 
@@ -199,6 +200,7 @@ class BindingOperationsTests(unittest.TestCase):
                 display_names={"a": "Agent A"},
                 native_controls={"a": native},
                 enabled_agents={"a"},
+                room_names={"channel": "Support"},
                 binding_id_factory=lambda: "logical-direct",
             )
 
@@ -237,12 +239,13 @@ class BindingOperationsTests(unittest.TestCase):
                 display_names={"a": "Agent A"},
                 native_controls={"a": native},
                 enabled_agents={"a"},
+                room_names={"channel": "Support"},
                 binding_id_factory=lambda: "logical-direct",
             )
 
             asyncio.run(control.create_direct("channel", "a"))
 
-            self.assertEqual(native.calls[0], ("create",))
+            self.assertEqual(native.calls[0], ("create", "Support · Agent A"))
             self.assertEqual(native.published, [("logical-direct", 1, "created-direct")])
             self.assertEqual(bridge.core.log.events("channel"), ())
             self.assertEqual(adapter.requests, [])

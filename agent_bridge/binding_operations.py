@@ -120,7 +120,7 @@ class NativeBindingControl(Protocol):
     mapping_field: str
     can_create: bool
     async def validate_existing(self, native_reference: str) -> None: ...
-    async def create(self) -> str: ...
+    async def create(self, name: str | None = None) -> str: ...
     def find_mapping(self, raw: dict[str, object], native_reference: str) -> tuple[str, int] | None: ...
     def mapping_entry(self, binding_id: str, generation: int, native_reference: str) -> dict[str, object]: ...
     def validate_publication(self, binding_id: str, generation: int, native_reference: str) -> None: ...
@@ -142,6 +142,7 @@ class BindingAdminControl:
         display_names: Mapping[str, str],
         native_controls: Mapping[str, NativeBindingControl] | None = None,
         enabled_agents: set[str] | None = None,
+        room_names: Mapping[str, str] | None = None,
         binding_id_factory=None,
     ) -> None:
         self.operations = operations
@@ -151,6 +152,7 @@ class BindingAdminControl:
         self.enabled_agents = set(
             self.adapter_types if enabled_agents is None else enabled_agents
         )
+        self.room_names = dict(room_names or {})
         self.binding_id_factory = binding_id_factory or (lambda: uuid4().hex)
         self._lock = asyncio.Lock()
 
@@ -232,7 +234,7 @@ class BindingAdminControl:
         async with self._lock:
             self._require_pending(room_id, agent_id)
             native = self._native(agent_id)
-            native_reference = await native.create()
+            native_reference = await native.create(self._thread_name(room_id, agent_id))
             raw, control = self.operations._load()
             try:
                 return await self._register_new(
@@ -268,7 +270,7 @@ class BindingAdminControl:
             native = self._native(agent_id)
             if not bool(getattr(native, "can_create", True)):
                 raise ValueError("這個 Adapter 不支援建立新的聊天窗")
-            native_reference = await native.create()
+            native_reference = await native.create(self._thread_name(room_id, agent_id))
             raw, control = self.operations._load()
             try:
                 self._register_direct(
@@ -314,6 +316,11 @@ class BindingAdminControl:
             return self.native_controls[agent_id]
         except KeyError as exc:
             raise ValueError("這個 Agent 尚未提供安全的聊天窗 control plane") from exc
+
+    def _thread_name(self, room_id: str, agent_id: str) -> str:
+        room_name = self.room_names.get(room_id, "Discord 對話")
+        agent_name = self.display_names.get(agent_id, agent_id)
+        return f"{' '.join(room_name.split())} · {' '.join(agent_name.split())}"
 
     def _require_pending(self, room_id: str, agent_id: str) -> None:
         if not any(

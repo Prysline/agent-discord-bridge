@@ -33,7 +33,7 @@ class AntigravityControlPlane:
         except Exception as exc:
             raise ValueError("Antigravity Conversation 驗證失敗") from exc
 
-    async def create(self) -> str:
+    async def create(self, name: str | None = None) -> str:
         raise ValueError("Antigravity conversation creation is not supported")
 
     def find_mapping(
