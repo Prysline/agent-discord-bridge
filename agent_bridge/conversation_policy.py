@@ -14,9 +14,9 @@ import re
 
 
 Phase = Literal[
-    "idle", "active", "closing-check", "completed", "stopped", "suspended"
+    "idle", "active", "closing-check", "awaiting-human", "completed", "stopped", "suspended"
 ]
-ResultStatus = Literal["continue", "complete", "abstain"]
+ResultStatus = Literal["continue", "complete", "abstain", "await-human"]
 DeliveryStatus = Literal["delivered", "not_delivered", "unknown"]
 FailureReason = Literal[
     "timeout",
@@ -181,11 +181,16 @@ class ConversationPolicy:
             return self._stop(state)
 
         if control == "start":
-            if state.phase in {"active", "closing-check"}:
+            if state.phase in {"active", "closing-check", "awaiting-human"}:
                 return Transition(False, "rejected", "discussion active; use !stop first")
             return self._start(state, event.channel_id, content)
 
         state.context_revision += 1
+        if state.phase == "awaiting-human":
+            state.phase = "active"
+            state.closing_remaining.clear()
+            state.suspension_reason = ""
+            return Transition(True, "human-resumed", "human response resumed discussion")
         if state.phase == "closing-check":
             state.phase = "active"
             state.closing_remaining.clear()
@@ -361,6 +366,10 @@ class ConversationPolicy:
         token = pending.token
 
         if token.phase == "active":
+            if pending.status == "await-human":
+                state.phase = "awaiting-human"
+                state.closing_remaining.clear()
+                return Transition(True, "awaiting-human", agent_id=token.agent_id)
             if pending.status == "complete":
                 state.phase = "closing-check"
                 state.closing_remaining = self._after(
@@ -378,6 +387,10 @@ class ConversationPolicy:
         state.next_index = (state.participants.index(token.agent_id) + 1) % len(
             state.participants
         )
+        if pending.status == "await-human":
+            state.phase = "awaiting-human"
+            state.closing_remaining.clear()
+            return Transition(True, "awaiting-human", agent_id=token.agent_id)
         if pending.status == "continue":
             state.phase = "active"
             state.closing_remaining.clear()
@@ -389,7 +402,7 @@ class ConversationPolicy:
 
     def on_process_restart(self) -> None:
         for state in self._states.values():
-            if state.phase in {"active", "closing-check"}:
+            if state.phase in {"active", "closing-check", "awaiting-human"}:
                 self._suspend(state, "process restarted")
 
     def _start(
@@ -510,9 +523,9 @@ class ConversationPolicy:
 
     @staticmethod
     def _validate_result(status: ResultStatus, text: str) -> None:
-        if status not in {"continue", "complete", "abstain"}:
+        if status not in {"continue", "complete", "abstain", "await-human"}:
             raise ValueError(f"invalid result status: {status}")
-        if status in {"continue", "complete"} and not text.strip():
+        if status in {"continue", "complete", "await-human"} and not text.strip():
             raise ValueError(f"{status} requires non-empty text")
         if status == "abstain" and text:
             raise ValueError("abstain must not include text")

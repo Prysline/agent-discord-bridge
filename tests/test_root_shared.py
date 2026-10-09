@@ -309,6 +309,37 @@ class RootSharedHumanTurnTests(unittest.TestCase):
         texts = [event["text"] for event in adapters["agent-a"].requests[0]["context"]["events"]]
         self.assertIn("one more constraint", texts)
 
+    def test_await_human_is_delivered_then_next_human_message_resumes_discussion(self):
+        waiting_adapter = FakeAdapter({
+            "requestId": "request-1",
+            "contextCommit": "committed",
+            "status": "await-human",
+            "text": "Which direction should we use?",
+        })
+        bridge, adapters, delivery = discussion_runtime(
+            adapters={"agent-a": waiting_adapter, "agent-b": FakeAdapter()},
+            maximum=3,
+        )
+        asyncio.run(bridge.handle(
+            allowed=True, is_peer=False, room_id="room-1", author_id="human",
+            display_name="Human", text="!discuss planner coder -- topic",
+            mentions_agent=True,
+        ))
+        outcomes = asyncio.run(bridge.drive_discussion("room-1"))
+        self.assertEqual(outcomes[-1].action, "awaiting-human")
+        self.assertEqual(bridge.core.policy.state("room-1").phase, "awaiting-human")
+        self.assertEqual(delivery.calls[0][2], "Which direction should we use?")
+        self.assertFalse(adapters["agent-b"].requests)
+
+        resumed = asyncio.run(bridge.handle(
+            allowed=True, is_peer=False, room_id="room-1", author_id="human",
+            display_name="Human", text="Use the safer direction",
+            mentions_agent=False,
+        ))
+        self.assertEqual(resumed.action, "discussion-resumed")
+        self.assertEqual(bridge.core.policy.state("room-1").phase, "active")
+        self.assertFalse(adapters["agent-b"].requests)
+
     def test_missing_participant_binding_rejects_whole_start(self):
         bindings = {("room-1", "agent-a"): BindingSnapshot("binding-a", 7)}
         bridge, adapters, _ = discussion_runtime(bindings=bindings)

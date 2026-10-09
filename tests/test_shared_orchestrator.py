@@ -36,7 +36,7 @@ class FakeAdapter:
             "contextCommit": self.context_commit,
             "status": self.status,
         }
-        if self.status in {"continue", "complete"}:
+        if self.status in {"continue", "complete", "await-human"}:
             result["text"] = self.text
         if self.status == "error":
             result["error"] = {
@@ -492,8 +492,12 @@ class SharedOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome[0].action, "invalid-response")
         self.assertEqual(delivery.calls, [])
 
-    async def test_complete_in_human_turn_and_abstain_with_text_are_invalid(self):
-        for status, text in (("complete", "done"), ("abstain", "not empty")):
+    async def test_discussion_only_statuses_are_invalid_in_human_turn(self):
+        for status, text in (
+            ("complete", "done"),
+            ("await-human", "need input"),
+            ("abstain", "not empty"),
+        ):
             core = self.make_core({"a": FakeAdapter(status, text=text)})
             core.ingest_human("room", author_id="h", display_name="H", text="hello")
             outcome = await core.run_human_turn("room", ("a",))

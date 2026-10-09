@@ -2,6 +2,8 @@ import asyncio
 import unittest
 from pathlib import Path
 
+from agent_bridge.contracts import ContractError
+
 from codex_adapter.app_server import (
     AppServerMethodUnsupported,
     AppServerProtocolError,
@@ -13,24 +15,25 @@ from codex_adapter.app_server import (
     _safe_error_summary,
 )
 from codex_adapter.control_plane import CodexControlPlane, CodexCreateAmbiguous, CodexCreateRejected
+from codex_adapter.contracts import final_text_result
 from codex_adapter.binding import (
     BindingGenerationMismatch,
     BindingUnavailable,
     InMemoryBindingResolver,
     ResolvedBinding,
 )
-from codex_adapter.persistent import CodexPersistentAdapter
+from codex_adapter.persistent import CodexPersistentAdapter, render_event_delta
 
 
 THREAD_ID = "thread-placeholder"
 REQUEST_ID = "request-placeholder"
 
 
-def request(*, request_id=REQUEST_ID, generation=3, timeout_ms=100):
-    return {
+def request(*, request_id=REQUEST_ID, generation=3, timeout_ms=100, mode="human-turn"):
+    value = {
         "requestId": request_id,
         "agentId": "agent-placeholder",
-        "mode": "human-turn",
+        "mode": mode,
         "binding": {"bindingId": "binding-placeholder", "generation": generation},
         "context": {
             "kind": "event-delta",
@@ -52,6 +55,14 @@ def request(*, request_id=REQUEST_ID, generation=3, timeout_ms=100):
         },
         "constraints": {"timeoutMs": timeout_ms},
     }
+    if mode == "bounded-discussion":
+        value["discussion"] = {
+            "discussionId": "discussion-placeholder",
+            "goal": "reach a conclusion",
+            "turnIndex": 1,
+            "phase": "active",
+        }
+    return value
 
 
 def user_item(request_id=REQUEST_ID):
@@ -180,6 +191,52 @@ class RecordingInvocationObserver:
         self.signals.append((request_id, certainty))
 
 
+class FinalTextResultTests(unittest.TestCase):
+    def test_human_turn_remains_plain_text(self):
+        result = final_text_result(
+            REQUEST_ID, "human-turn", "plain reply", adapter="codex"
+        )
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(result["text"], "plain reply")
+
+    def test_bounded_discussion_accepts_frozen_status_shapes(self):
+        cases = (
+            ('{"status":"continue","text":"more"}', "continue", "more"),
+            ('{"status":"complete","text":"done"}', "complete", "done"),
+            ('{"status":"await-human","text":"choose a direction"}', "await-human", "choose a direction"),
+            ('{"status":"abstain"}', "abstain", None),
+        )
+        for text, status, body in cases:
+            result = final_text_result(
+                REQUEST_ID, "bounded-discussion", text, adapter="codex"
+            )
+            self.assertEqual(result["status"], status)
+            self.assertEqual(result.get("text"), body)
+            self.assertEqual(result["diagnostics"]["adapter"], "codex")
+
+    def test_bounded_discussion_rejects_ambiguous_or_extra_output(self):
+        invalid = (
+            "plain reply",
+            '```json\n{"status":"complete","text":"done"}\n```',
+            '{"status":"abstain","text":"extra"}',
+            '{"status":"complete","text":""}',
+            '{"status":"complete","text":"done","extra":true}',
+        )
+        for text in invalid:
+            with self.assertRaises(ContractError):
+                final_text_result(
+                    REQUEST_ID, "bounded-discussion", text, adapter="codex"
+                )
+
+    def test_only_bounded_prompt_requests_structured_status(self):
+        human_prompt = render_event_delta(request())
+        bounded_prompt = render_event_delta(request(mode="bounded-discussion"))
+        self.assertNotIn("status 只能是", human_prompt)
+        self.assertIn("status 只能是 continue、complete、abstain、await-human", bounded_prompt)
+        self.assertIn("需要人類補充資訊或決策", bounded_prompt)
+        self.assertIn("不要使用 Markdown code fence", bounded_prompt)
+
+
 class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_capabilities_match_persistent_phase_one_contract(self):
         self.assertEqual(
@@ -233,6 +290,26 @@ class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["status"], "continue")
         self.assertEqual(observer.signals, [(REQUEST_ID, "confirmed")])
+
+    async def test_bounded_final_is_parsed_before_core_delivery(self):
+        client = FakeClient()
+        client.wait_outcome = turn(text='{"status":"complete","text":"conclusion"}')
+        result = await CodexPersistentAdapter(client, FakeResolver()).execute(
+            request(mode="bounded-discussion")
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["text"], "conclusion")
+        self.assertEqual(result["diagnostics"]["adapter"], "codex")
+
+    async def test_bounded_plain_final_fails_closed(self):
+        client = FakeClient()
+        client.wait_outcome = turn(text="looks done")
+        result = await CodexPersistentAdapter(client, FakeResolver()).execute(
+            request(mode="bounded-discussion")
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["contextCommit"], "committed")
+        self.assertEqual(result["error"]["code"], "invalid_response")
 
     async def test_live_failed_turn_preserves_unsupported_chatgpt_model_reason(self):
         client = FakeClient()

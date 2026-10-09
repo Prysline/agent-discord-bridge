@@ -126,7 +126,8 @@ class RootSharedHumanTurn:
             return RootHumanTurnResult(outcome.action, (outcome,))
 
         selected_agent = target_agent_id or self.agent_id
-        if self.core.policy.state(room_id).phase in {"active", "closing-check"}:
+        phase = self.core.policy.state(room_id).phase
+        if phase in {"active", "closing-check", "awaiting-human"}:
             outcome = self.core.ingest_human(
                 room_id,
                 author_id=author_id,
@@ -139,7 +140,8 @@ class RootSharedHumanTurn:
                 timestamp=timestamp,
                 allow_control=False,
             )
-            return RootHumanTurnResult("discussion-context", (outcome,))
+            action = "discussion-resumed" if outcome.action == "human-resumed" else "discussion-context"
+            return RootHumanTurnResult(action, (outcome,))
         key = (room_id, selected_agent)
         if self.core.binding(room_id, selected_agent) is None:
             if key in self._onboarding:

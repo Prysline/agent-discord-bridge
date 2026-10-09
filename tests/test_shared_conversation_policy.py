@@ -188,6 +188,47 @@ class SharedConversationPolicyTests(unittest.TestCase):
         self.assertEqual(value.state("room").phase, "active")
         self.assertEqual(value.state("room").closing_remaining, [])
 
+    def test_await_human_stops_dispatch_until_human_resumes(self):
+        value = policy()
+        start(value)
+        begun = value.begin_dispatch("room")
+        waiting = finish(
+            value,
+            "room",
+            begun.token,
+            status="await-human",
+            text="Please choose a direction",
+        )
+        self.assertEqual(waiting.action, "awaiting-human")
+        self.assertEqual(value.state("room").phase, "awaiting-human")
+        self.assertEqual(value.next_dispatch("room").action, "blocked")
+
+        resumed = value.handle_event(human("Use the safer option"))
+        self.assertEqual(resumed.action, "human-resumed")
+        self.assertEqual(value.state("room").phase, "active")
+        self.assertEqual(value.next_dispatch("room").agent_id, "b")
+
+    def test_await_human_requires_delivered_text_and_stop_remains_available(self):
+        value = policy()
+        start(value)
+        begun = value.begin_dispatch("room")
+        with self.assertRaises(ValueError):
+            value.record_result("room", begun.token, status="await-human", text="")
+        waiting = finish(
+            value, "room", begun.token, status="await-human", text="Need input"
+        )
+        stopped = value.handle_event(human("!stop"))
+        self.assertEqual(waiting.action, "awaiting-human")
+        self.assertEqual(stopped.action, "stopped")
+
+    def test_restart_fails_closed_while_awaiting_human(self):
+        value = policy()
+        start(value)
+        begun = value.begin_dispatch("room")
+        finish(value, "room", begun.token, status="await-human", text="Need input")
+        value.on_process_restart()
+        self.assertEqual(value.state("room").phase, "suspended")
+
     def test_dispatch_snapshot_does_not_live_inject_later_human_event(self):
         value = policy()
         start(value)

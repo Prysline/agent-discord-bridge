@@ -147,8 +147,12 @@ class AntigravityAdapterTests(unittest.TestCase):
             bootstrap_existing_bindings(raw)
 
     def test_human_and_bounded_requests_preserve_core_request_id(self):
-        for mode in ("human-turn", "bounded-discussion"):
-            transport = FakeTransport()
+        cases = (
+            ("human-turn", "reply"),
+            ("bounded-discussion", '{"status":"continue","text":"reply"}'),
+        )
+        for mode, text in cases:
+            transport = FakeTransport(results=[{"status": "completed", "text": text}])
             adapter = AntigravityPersistentAdapter(transport, bootstrap_existing_bindings(bindings()).binding_resolver)
             observer = Observer()
             result = asyncio.run(adapter.execute(request(mode=mode), observer=observer))
@@ -157,6 +161,36 @@ class AntigravityAdapterTests(unittest.TestCase):
             self.assertEqual(result["contextCommit"], "committed")
             self.assertEqual(observer.calls, [("request-1", "confirmed")])
             self.assertEqual(transport.last_result_id, "local-1")
+
+    def test_bounded_result_supports_complete_and_abstain(self):
+        cases = (
+            ('{"status":"complete","text":"conclusion"}', "complete", "conclusion"),
+            ('{"status":"await-human","text":"need a choice"}', "await-human", "need a choice"),
+            ('{"status":"abstain"}', "abstain", None),
+        )
+        for text, status, expected_text in cases:
+            transport = FakeTransport(results=[{"status": "completed", "text": text}])
+            adapter = AntigravityPersistentAdapter(
+                transport, bootstrap_existing_bindings(bindings()).binding_resolver
+            )
+            result = asyncio.run(
+                adapter.execute(request(mode="bounded-discussion"), observer=Observer())
+            )
+            self.assertEqual(result["status"], status)
+            self.assertEqual(result.get("text"), expected_text)
+            self.assertEqual(result["diagnostics"]["adapter"], "antigravity")
+
+    def test_bounded_plain_text_fails_closed(self):
+        adapter = AntigravityPersistentAdapter(
+            FakeTransport(results=[{"status": "completed", "text": "looks done"}]),
+            bootstrap_existing_bindings(bindings()).binding_resolver,
+        )
+        result = asyncio.run(
+            adapter.execute(request(mode="bounded-discussion"), observer=Observer())
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["contextCommit"], "committed")
+        self.assertEqual(result["error"]["code"], "invalid_response")
 
     def test_preflight_failure_does_not_signal_invocation(self):
         adapter = AntigravityPersistentAdapter(FakeTransport(health_error=SidecarUnavailable("down")), bootstrap_existing_bindings(bindings()).binding_resolver)
@@ -380,7 +414,7 @@ class HeterogeneousCompositionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing"):
                 compose_existing_heterogeneous_root(binding_path=path, primary_agent_id="agent-b", adapter_types={"agent-b":"antigravity"}, codex_client=object(), antigravity_transport=FakeTransport(), delivery=Delivery(), participants=[participant], display_names={"agent-b":"B"}, global_max_dispatches=1)
 
-    def test_discussion_round_robin_uses_real_production_adapter_classes(self):
+    def test_production_adapters_complete_through_shared_closing_check(self):
         raw = {
             "logicalBindings":[
                 {"roomId":"room","agentId":"agent-a","bindingId":"binding-a","generations":[1],"activeGeneration":1},
@@ -390,7 +424,16 @@ class HeterogeneousCompositionTests(unittest.TestCase):
             "antigravityBindings":[{"bindingId":"binding-b","generation":3,"conversationId":"conversation-b"}],
         }
         client = FakeCodexClient()
-        transport = FakeTransport()
+        client._turn = lambda: {
+            "id":"turn-a", "status":"completed", "items":[
+                {"type":"userMessage", "clientId":client.current_request_id, "text":"redacted"},
+                {"type":"agentMessage", "phase":"final_answer", "text":'{"status":"complete","text":"codex conclusion"}'},
+            ],
+        }
+        transport = FakeTransport(results=[{
+            "status": "completed",
+            "text": '{"status":"complete","text":"antigravity confirms"}',
+        }])
         participants = [Participant("agent-a","101",1000,2), Participant("agent-b","202",1000,2)]
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"bindings.json"; path.write_text(json.dumps(raw), encoding="utf-8")
@@ -409,13 +452,15 @@ class HeterogeneousCompositionTests(unittest.TestCase):
             second = asyncio.run(bridge.core.run_discussion_turn("room"))
         self.assertEqual(started.action, "started")
         self.assertEqual((first.agent_id, second.agent_id), ("agent-a", "agent-b"))
+        self.assertEqual((first.action, second.action), ("closing-check", "completed"))
+        self.assertEqual(bridge.core.policy.state("room").phase, "completed")
         self.assertIsInstance(bridge.core.adapters["agent-a"], CodexPersistentAdapter)
         self.assertIsInstance(bridge.core.adapters["agent-b"], AntigravityPersistentAdapter)
         self.assertEqual(client.resume_calls, ["thread-a"])
         self.assertEqual(transport.sends[0][0], "conversation-b")
         self.assertIn('"mode":"bounded-discussion"', client.start_calls[0][1])
         self.assertIn('"mode":"bounded-discussion"', transport.sends[0][1])
-        self.assertIn("codex reply", transport.sends[0][1])
+        self.assertIn("codex conclusion", transport.sends[0][1])
         self.assertNotIn("conversation-b", client.start_calls[0][1])
         self.assertNotIn("thread-a", transport.sends[0][1])
 

@@ -36,7 +36,7 @@
 - `tests/`：routing policy 與 Codex adapter tests。
 - `shared_workspace/`：預設隔離工作目錄說明。
 
-Shared orchestration core 已能以 fake adapter 驗證 `continue`／`complete`／`abstain` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；本機 bootstrap 以 exact `bindingId + generation` 載入既有 Codex thread。Opt-in human-turn root path，以及 Codex + Antigravity bounded discussion（含 human intervention 與 in-flight `!stop`）均已完成一次真人 Discord E2E。Codex adapter 對真實模型 final 仍只回傳 `continue`，durable restart、完整 production rollout與端到端 closing-check 仍未完成。
+Shared orchestration core 已驗證 `continue`／`complete`／`abstain`／`await-human` lifecycle，並讓 Codex persistent adapter 重用 shared request validator；本機 bootstrap 以 exact `bindingId + generation` 載入既有 Codex thread。Bounded discussion 會要求 runtime 回傳單一結構化 JSON 結果，Codex 與 Antigravity adapter 均會 fail closed 地解析 status，再由 shared core 執行 closing-check 或進入等待人類狀態。`await-human` 的說明送達 Discord 後會停止排程；下一則通過既有 access policy 的人類訊息加入 canonical context 並恢復討論，`!stop` 仍可終止。跨 adapter 的自動整合測試已覆蓋兩方確認完成。Opt-in human-turn root path，以及 Codex + Antigravity bounded discussion（含 human intervention 與 in-flight `!stop`）均已完成一次真人 Discord E2E，但新增的結構化完成與等待人類判斷尚未另做真人 E2E。Durable restart 與完整 production rollout仍未完成。
 
 ## 安裝與首次啟動
 

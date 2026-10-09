@@ -308,7 +308,7 @@ class SharedOrchestrator:
         state = self.policy.state(room_id)
         cursor = self._cursors.get((room_id, agent_id))
         return (
-            state.phase in {"active", "closing-check"}
+            state.phase in {"active", "closing-check", "awaiting-human"}
             or (room_id, agent_id) in self._pending_delivery
             or (cursor is not None and (cursor.pending_request_id is not None or cursor.uncertain))
             or any(key[0] == room_id for key in self._discussion_requests.values())

@@ -144,15 +144,15 @@ def validate_agent_result(
     if root.get("contextCommit") not in CONTEXT_COMMITS:
         raise ContractError("result contextCommit is invalid")
     status = root.get("status")
-    if status not in {"continue", "complete", "abstain", "error"}:
+    if status not in {"continue", "complete", "abstain", "await-human", "error"}:
         raise ContractError("result status is invalid")
 
     text = root.get("text")
     if status == "continue":
         _string(text, "result.text")
-    elif status == "complete":
+    elif status in {"complete", "await-human"}:
         if mode != "bounded-discussion":
-            raise ContractError("complete is only valid for bounded-discussion")
+            raise ContractError(f"{status} is only valid for bounded-discussion")
         _string(text, "result.text")
     elif status == "abstain":
         if mode != "bounded-discussion":

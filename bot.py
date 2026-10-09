@@ -1101,6 +1101,8 @@ async def drive_shared_discussion(room_id: str, channel) -> None:
         final = outcomes[-1]
         if final.action == "completed":
             await channel.send(system_message("討論已完成。"))
+        elif final.action == "awaiting-human":
+            await channel.send(system_message("討論正在等待人類回應；回覆後會自動繼續，或使用 !stop 結束。"))
         elif final.action in {
             "binding-unavailable",
             "context-unknown",
@@ -1361,7 +1363,7 @@ async def on_message(message: discord.Message):
                 replied_bot_id = replied_managed_bot_id(message)
                 if control is None:
                     phase = shared_root.core.policy.state(room_id).phase
-                    if phase in {"active", "closing-check"}:
+                    if phase in {"active", "closing-check", "awaiting-human"}:
                         stripped = effective_text
                         for mentioned_bot_id in mentioned_bot_ids:
                             updated = shared_root.strip_ingress_mention(stripped, mentioned_bot_id)
@@ -1433,6 +1435,10 @@ async def on_message(message: discord.Message):
                 await safe_add_reaction(message, "✅")
                 return
             if result is not None and result.action == "discussion-context":
+                await safe_add_reaction(message, "✅")
+                return
+            if result is not None and result.action == "discussion-resumed":
+                start_shared_discussion(room_id, message.channel)
                 await safe_add_reaction(message, "✅")
                 return
             if result is not None and result.action == "onboarding-required":

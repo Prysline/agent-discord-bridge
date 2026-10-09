@@ -27,7 +27,7 @@ Discord ingress
 - bounded discussion 直接使用 `ConversationPolicy`，不另寫 round-robin、quota 或 closing-check state machine；discussion 開始時 snapshot room-specific existing bindings。
 - 每個 room／agent／binding generation 維護 `lastCanonicalSyncedSeq`、`nativeKnownSeqs` 與 pending context fence。Request 以 dispatch 當下 high watermark 建立 immutable event-delta snapshot。
 - `contextCommit=committed` 才推進 contiguous coverage；`not_committed` 不推進；`unknown` 與 invalid response 保留 uncertainty fence，不 replay。
-- `continue`／`complete` delivery confirmed 後，先 append 完整 agent canonical event，再推進 shared policy；`unknown` 不建立 ghost event並阻止同 room 下一個 AI，`not_delivered` fail closed。`abstain` 不發 Discord、不建立 canonical output。
+- `continue`／`complete`／`await-human` delivery confirmed 後，先 append 完整 agent canonical event，再推進 shared policy；`unknown` 不建立 ghost event並阻止同 room 下一個 AI，`not_delivered` fail closed。`abstain` 不發 Discord、不建立 canonical output。
 - `!stop` 先 invalidates policy token，再依 adapter capability best-effort cancel；尚未 attempt 的 late output 不再送出，已 attempt 且 outcome unknown 的 delivery 則保留 reconciliation fence。之後確認 delivered 只補 canonical history 與字元 accounting，不恢復 discussion；確認未送達不補送。restart 將 active discussion suspended，且遺失的 pending context／delivery 保留 uncertainty，不宣稱可恢復。
 
 `agent_bridge/contracts.py` 是 wiring 使用的 shared request／result validator；`codex_adapter/contracts.py` 保留 Codex result helpers，但重用同一份 shared AgentRequest validation，避免 schema 漂移。
@@ -75,10 +75,11 @@ multiprocess coordination、retire 或 generation advancement。
 - Peer Discord output 只成為 context，不觸發下一位 agent。
 - 普通 human intervention 不重排 round-robin；若正在 closing check，則取消 closing check 並恢復 active。
 - `complete` 進入 closing check；只要出現 `continue` 就回 active；其餘有效 participant 都完成最後確認後才 completed。
+- `await-human` 只有在說明文字確認送達後才進入 awaiting-human 並停止排程；下一則通過既有 access policy 的 human context 恢復 active，不另觸發 human-turn。`!stop` 仍會 invalidated 整場討論。
 - 每位 agent 各自維護 `budgetChars`／`usedChars`／`maxCalls`／`usedCalls`；adapter 透過 execution lifecycle observer 在 `turn/start` confirmed 或 ambiguous 時才增加 `usedCalls`。`globalMaxDispatches` 是 core dispatch reservation 的 unattended hard stop，與實際 model-call accounting 分開。
 - 合法開始的 output 不因事後超額被截斷；字元只在 Discord delivery confirmed 後計入。
-- 帶正文的 `continue`／`complete` 先進入 delivery-pending fence，只有 confirmed delivery 才套用 discussion semantics；outcome unknown 維持 fence，確認未送達則 suspend。無正文的 `abstain` 驗證後直接推進狀態，不建立 delivery 或 canonical message。
-- `!stop` 使當前 dispatch invalidated；process restart 將 active／closing-check 轉為 suspended。
+- 帶正文的 `continue`／`complete`／`await-human` 先進入 delivery-pending fence，只有 confirmed delivery 才套用 discussion semantics；outcome unknown 維持 fence，確認未送達則 suspend。無正文的 `abstain` 驗證後直接推進狀態，不建立 delivery 或 canonical message。
+- `!stop` 使當前 dispatch invalidated；process restart 將 active／closing-check／awaiting-human 轉為 suspended。
 
 目前根目錄 `conversation_policy.py` 與 `bot.py` 仍是 Codex migration baseline，也不是 frozen shared contract。舊 runtime 仍會讀取 Discord recent history、使用 peer mention chaining，並在 thread 遺失時自動建立新 thread；shared path 不使用這些語意。
 
@@ -97,7 +98,7 @@ multiprocess coordination、retire 或 generation advancement。
 
 Sidecar `/send` 接受後才回報 confirmed invocation；送出結果不明則保守回報 ambiguous invocation 並以可得 request identity read back。Sidecar 只使用明確設定的 transcript root，於 dispatch 前保存 expected path、file identity 與 byte offset；`/result` 僅解析該 offset 後的 bounded、完整 JSONL records，並要求唯一 marker 與唯一合格 final。路徑越界、identity replacement、截斷或模糊結果全部 fail closed。Stop hook 與 polling 共用相同 extractor 與 terminal-state lock，因此 hook 是 optional fast path，不是 correctness dependency。
 
-唯一 positive result 才把 context 判為 committed；無法相關時維持 unknown，不 replay。正式模型輸出目前一律映射為 `continue`，不自行發明 `complete`／`abstain` parser。平台沒有已證明的強 cancellation，因此 capability 是 `canCancelInFlight=false`；core invalidation 仍保證 late output 不會被送往 Discord或推進 discussion。
+唯一 positive result 才把 context 判為 committed；無法相關時維持 unknown，不 replay。Human-turn final 維持純文字並映射為 `continue`；bounded-discussion final 則必須是只含 `status` 與必要 `text` 的單一 JSON object，Codex 與 Antigravity adapter 支援 `continue`／`complete`／`abstain`／`await-human`，格式模糊或不合約時以 committed `invalid_response` fail closed。狀態、closing-check 與 awaiting-human 語意仍只由 shared core 決定。平台沒有已證明的強 cancellation，因此 capability 是 `canCancelInFlight=false`；core invalidation 仍保證 late output 不會被送往 Discord或推進 discussion。此結構化狀態路徑已通過本機自動整合測試，尚未另做真人 Discord E2E。
 
 Hookless recovery 已使用 real temporary filesystem、production Sidecar State 與 fake `agentapi` subprocess 測試，真實 Antigravity Sidecar、Codex binding 與 Discord 同場往返也已完成 Manual E2E。Sidecar request state仍只存在 process memory，restart 後不提供 durable recovery，因此不得稱為 production-ready。
 
