@@ -7,7 +7,11 @@ from pathlib import Path
 from agent_bridge import ConversationPolicy, Participant
 from agent_bridge.discord_delivery import DiscordRoomDelivery
 from agent_bridge.orchestrator import BindingSnapshot, CoreOutcome, SharedOrchestrator
-from agent_bridge.root_shared import RootSharedHumanTurn, safe_failure_message
+from agent_bridge.root_shared import (
+    RootSharedHumanTurn,
+    discussion_failure_message,
+    safe_failure_message,
+)
 from codex_adapter.root_composition import (
     compose_existing_codex_root,
     parse_root_discussion_settings,
@@ -425,6 +429,28 @@ class RootSharedHumanTurnTests(unittest.TestCase):
         result = asyncio.run(bridge.handle(allowed=True, is_peer=False, room_id="room-1", author_id="human", display_name="Human", text="hello", mentions_agent=True))
         self.assertEqual(result.outcomes[0].action, "suspended")
         self.assertIn("無法送到", safe_failure_message(result.outcomes))
+
+    def test_discussion_failure_messages_classify_safe_failure_boundaries(self):
+        cases = {
+            "binding-unavailable": "聊天窗綁定",
+            "context-unknown": "接收上下文",
+            "delivery-unknown": "Discord 回覆是否送達",
+            "not-committed": "未接受或未完成",
+            "invalid-response": "回覆格式無法驗證",
+            "adapter-error": "後台執行失敗",
+            "suspended": "無法送到這個頻道",
+        }
+        for action, expected in cases.items():
+            with self.subTest(action=action):
+                outcome = CoreOutcome(
+                    action,
+                    request_id="request-a",
+                    agent_id="agent-a",
+                    reason="private detail",
+                )
+                message = discussion_failure_message((outcome,))
+                self.assertIn(expected, message)
+                self.assertNotIn("private detail", message)
 
 
 class DiscordRoomDeliveryTests(unittest.TestCase):

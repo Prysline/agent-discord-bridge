@@ -211,3 +211,20 @@ def safe_failure_message(outcomes: tuple[CoreOutcome, ...]) -> str | None:
     ):
         return "設定的 Codex 模型不支援目前登入的 ChatGPT 帳號。請在本機 Agent 管理前台改選模型，重新啟動 Bot，並為頻道建立新的 Codex Thread。"
     return "後台這次沒有完成回覆，且不會改走舊流程重試。"
+
+
+def discussion_failure_message(outcomes: tuple[CoreOutcome, ...]) -> str:
+    """Describe a stopped discussion without exposing private runtime details."""
+    if not outcomes:
+        return "討論已暫停：後台沒有回傳可確認的結果。"
+    action = outcomes[-1].action
+    messages = {
+        "binding-unavailable": "討論已暫停：找不到可用的既有聊天窗綁定。",
+        "context-unknown": "討論已暫停：無法確認 Agent 是否已接收上下文。",
+        "delivery-unknown": "討論已暫停：無法確認 Discord 回覆是否送達。",
+        "not-committed": "討論已暫停：Agent 後台未接受或未完成這一輪請求。請查看 Bot 終端機診斷；系統不會自動重試。",
+        "invalid-response": "討論已暫停：Agent 回覆格式無法驗證。",
+        "adapter-error": "討論已暫停：Agent 後台執行失敗。請查看 Bot 終端機診斷；系統不會自動重試。",
+        "suspended": "討論已暫停：Agent 回覆無法送到這個頻道。",
+    }
+    return messages.get(action, "討論已暫停：後台沒有完成這一輪。")

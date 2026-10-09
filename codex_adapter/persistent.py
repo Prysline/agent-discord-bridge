@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
@@ -15,6 +16,7 @@ from .app_server import (
     AppServerProtocolError,
     AppServerRpcError,
     AppServerTransportError,
+    _safe_error_summary,
 )
 from .binding import (
     BindingGenerationMismatch,
@@ -30,6 +32,9 @@ from .contracts import (
     final_text_result,
     validate_persistent_request,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 class AppServerClient(Protocol):
@@ -217,7 +222,24 @@ class CodexPersistentAdapter:
                 False,
                 "thread_resume",
             )
-        except (AppServerRpcError, AppServerProtocolError):
+        except AppServerRpcError as exc:
+            log.warning(
+                "Codex request failed: stage=thread_resume error=%s",
+                _safe_error_summary(str(exc)),
+            )
+            return error_result(
+                request_id,
+                "not_committed",
+                "binding_unavailable",
+                "existing Codex thread could not be resumed",
+                False,
+                "thread_resume",
+            )
+        except AppServerProtocolError as exc:
+            log.warning(
+                "Codex request failed: stage=thread_resume error=%s",
+                type(exc).__name__,
+            )
             return error_result(
                 request_id,
                 "not_committed",
@@ -301,7 +323,11 @@ class CodexPersistentAdapter:
                 False,
                 "turn_start",
             )
-        except AppServerRpcError:
+        except AppServerRpcError as exc:
+            log.warning(
+                "Codex request failed: stage=turn_start error=%s",
+                _safe_error_summary(str(exc)),
+            )
             return error_result(
                 request_id,
                 "not_committed",

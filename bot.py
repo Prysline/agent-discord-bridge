@@ -31,7 +31,7 @@ from agent_bridge.discord_reply_routing import (
     system_message,
 )
 from agent_bridge.heterogeneous_composition import compose_existing_heterogeneous_root
-from agent_bridge.root_shared import safe_failure_message
+from agent_bridge.root_shared import discussion_failure_message, safe_failure_message
 from antigravity_adapter.control_plane import AntigravityControlPlane
 from antigravity_adapter.transport import SidecarHttpClient
 from codex_adapter.app_server import (
@@ -1112,7 +1112,14 @@ async def drive_shared_discussion(room_id: str, channel) -> None:
             "adapter-error",
             "suspended",
         }:
-            await channel.send(system_message("討論已暫停，這次不會改走舊流程重試。"))
+            for outcome in outcomes:
+                log.warning(
+                    "Shared discussion outcome: agent=%s action=%s reason=%s",
+                    outcome.agent_id or "-",
+                    outcome.action,
+                    outcome.reason or "-",
+                )
+            await channel.send(system_message(discussion_failure_message(outcomes)))
     except Exception:
         log.exception("shared bounded discussion 發生未預期錯誤")
     finally:

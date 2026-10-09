@@ -283,6 +283,26 @@ class PersistentAdapterTests(unittest.IsolatedAsyncioTestCase):
                 await CodexPersistentAdapter(client, resolver).execute(raw, observer=observer)
                 self.assertEqual(observer.signals, [])
 
+    async def test_rpc_rejections_log_safe_failure_stage(self):
+        resume_failure = FakeClient()
+        resume_failure.resume_outcome = AppServerRpcError(
+            -32000, "resume rejected token=secret-value C:\\private\\thread.json"
+        )
+        with self.assertLogs("codex_adapter.persistent", level="WARNING") as captured:
+            await CodexPersistentAdapter(resume_failure, FakeResolver()).execute(request())
+        log_text = "\n".join(captured.output)
+        self.assertIn("stage=thread_resume", log_text)
+        self.assertIn("token=<redacted>", log_text)
+        self.assertIn("<path>", log_text)
+        self.assertNotIn("secret-value", log_text)
+        self.assertNotIn("private", log_text)
+
+        start_failure = FakeClient()
+        start_failure.start_outcome = AppServerRpcError(-32000, "turn rejected")
+        with self.assertLogs("codex_adapter.persistent", level="WARNING") as captured:
+            await CodexPersistentAdapter(start_failure, FakeResolver()).execute(request())
+        self.assertIn("stage=turn_start", "\n".join(captured.output))
+
     async def test_successful_start_emits_one_confirmed_invocation_signal(self):
         observer = RecordingInvocationObserver()
         result = await CodexPersistentAdapter(FakeClient(), FakeResolver()).execute(
