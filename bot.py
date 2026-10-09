@@ -21,7 +21,7 @@ import discord
 import websockets
 from dotenv import load_dotenv
 
-from agent_bridge.agent_management import load_agent_management
+from agent_bridge.agent_management import load_agent_management, resolve_codex_cwd
 from agent_bridge.admin_ui import create_server as create_admin_server
 from agent_bridge.binding_operations import BindingAdminControl, BindingOperations
 from agent_bridge.discord_delivery import DiscordSenderDelivery
@@ -1270,10 +1270,16 @@ async def on_ready():
                 for agent_id, adapter_type in shared_discussion.adapter_types.items():
                     adapter = shared_root.core.adapters[agent_id]
                     if adapter_type == "codex":
-                        configured_model = managed_agents[agent_id].model or CODEX_MODEL
+                        managed_agent = managed_agents[agent_id]
+                        configured_model = managed_agent.model or CODEX_MODEL
+                        configured_cwd = resolve_codex_cwd(
+                            managed_agent.cwd,
+                            root=BOT_DIR,
+                            fallback=CODEX_CWD,
+                        )
                         native_controls[agent_id] = CodexControlPlane(
                             shared_app_client,
-                            cwd=CODEX_CWD,
+                            cwd=configured_cwd,
                             model=configured_model,
                             base_instructions=PERSONA_INSTRUCTIONS,
                             resolver=adapter.binding_resolver,
@@ -1303,6 +1309,8 @@ async def on_ready():
                     access_config_path=BOT_DIR / "config.json",
                     codex_models=available_codex_models,
                     default_codex_model=CODEX_MODEL,
+                    default_codex_cwd=str(CODEX_CWD),
+                    codex_cwd_root=BOT_DIR,
                 )
                 shared_admin_thread = threading.Thread(
                     target=shared_admin_server.serve_forever,

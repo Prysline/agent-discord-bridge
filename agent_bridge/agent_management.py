@@ -18,6 +18,7 @@ class ManagedAgent:
     agent_alias: str
     adapter: str
     model: str
+    cwd: str
     mention_id: str
     sender_id: str
     enabled: bool
@@ -68,6 +69,7 @@ class AgentManagement:
                     "agentAlias": item.agent_alias,
                     "adapter": item.adapter,
                     "model": item.model,
+                    "cwd": item.cwd,
                     "mentionId": item.mention_id,
                     "senderId": item.sender_id,
                     "enabled": item.enabled,
@@ -152,6 +154,13 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
             errors.append(f"{field}.model: 必須是單行字串")
             model = ""
         model = model.strip()
+        cwd = value.get("cwd", "")
+        if not isinstance(cwd, str) or "\n" in cwd or "\r" in cwd:
+            errors.append(f"{field}.cwd: 必須是單行字串")
+            cwd = ""
+        cwd = cwd.strip()
+        if adapter == "antigravity" and cwd:
+            errors.append(f"{field}.cwd: Antigravity 不使用 Codex 工作目錄")
         mention_id = _snowflake(value.get("mentionId"), f"{field}.mentionId", errors)
         sender_id = _text(value.get("senderId"), f"{field}.senderId", errors)
         enabled = _bool(value.get("enabled", True), f"{field}.enabled", errors)
@@ -171,7 +180,7 @@ def parse_agent_management(raw: Mapping[str, Any]) -> AgentManagement:
             errors.append(f"{field}.senderId: 啟用的 Agent 必須使用啟用的 Sender")
         if enabled and mention_id not in enabled_bot_user_ids:
             errors.append(f"{field}.mentionId: 必須對應啟用的 Discord Sender Bot User ID")
-        agents.append(ManagedAgent(agent_id, display_name, agent_alias, str(adapter), model, mention_id, sender_id, enabled, available, budget, calls))
+        agents.append(ManagedAgent(agent_id, display_name, agent_alias, str(adapter), model, cwd, mention_id, sender_id, enabled, available, budget, calls))
     if errors:
         raise ValueError("\n".join(errors))
     return AgentManagement(tuple(agents), tuple(senders))
@@ -185,7 +194,7 @@ def load_agent_management(path: Path, legacy_config: Mapping[str, Any], token: s
         ManagedAgent(
             str(item["agentId"]), str(item.get("displayName", item["agentId"])),
             str(item.get("agentAlias", item["agentId"])),
-            str(item["adapter"]), str(item.get("model", "")), str(item["mentionId"]), "legacy-default",
+            str(item["adapter"]), str(item.get("model", "")), str(item.get("cwd", "")), str(item["mentionId"]), "legacy-default",
             bool(item.get("enabled", True)), bool(item.get("available", True)),
             int(item["budgetChars"]), int(item["maxCalls"]),
         )
@@ -210,6 +219,7 @@ def save_agent_management(path: Path, value: AgentManagement) -> None:
         "agents": [
             {"agentId": a.agent_id, "displayName": a.display_name, "agentAlias": a.agent_alias, "adapter": a.adapter,
              "model": a.model,
+             "cwd": a.cwd,
              "mentionId": a.mention_id, "senderId": a.sender_id, "enabled": a.enabled,
              "available": a.available, "budgetChars": a.budget_chars, "maxCalls": a.max_calls}
             for a in value.agents
@@ -240,6 +250,22 @@ def sender_usage(value: AgentManagement) -> dict[str, list[str]]:
         if agent.enabled:
             usage.setdefault(agent.sender_id, []).append(agent.agent_id)
     return usage
+
+
+def resolve_codex_cwd(value: str, *, root: Path, fallback: Path) -> Path:
+    target = Path(value) if value else fallback
+    if not target.is_absolute():
+        target = root / target
+    resolved = target.resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"Codex 工作目錄不存在或不是資料夾: {resolved}")
+    return resolved
+
+
+def validate_agent_workdirs(value: AgentManagement, root: Path) -> None:
+    for agent in value.agents:
+        if agent.adapter == "codex" and agent.cwd:
+            resolve_codex_cwd(agent.cwd, root=root, fallback=root)
 
 
 def validate_binding_associations(value: AgentManagement, raw: Mapping[str, Any]) -> None:

@@ -142,7 +142,11 @@ SHARED_BINDINGS_PATH=bindings.local.json
 ```
 
 `SHARED_AGENT_ID` 必須和 `config.json` participant 的 `agentId` 完全相同。
-`CODEX_CWD` 是 Agent 的隔離工作目錄；相對路徑會以 repo 根目錄解析。
+`CODEX_CWD` 是 Codex Agent 的預設工作目錄；相對路徑會以 repo 根目錄解析。
+啟動管理前台後，可在「Agent 管理」下方的「Codex 專案工作目錄」為每個 Codex
+Agent 覆寫這個值。欄位可填絕對路徑或相對於 Bridge repo 的路徑，留白則沿用
+`CODEX_CWD`。儲存時會確認資料夾存在；設定只用於之後建立的新 Thread，不會搬移或
+修改既有 Thread。Antigravity Conversation 的 Project／工作目錄不由這個欄位控制。
 `ROOT_BOT_LABEL` 只用於終端機與視窗標題，不代表任何 Agent；
 `LEGACY_AGENT_DISPLAY_NAME` 只供未啟用 shared core 時的 legacy prompt 使用。
 舊版 `.env` 的 `BOT_DISPLAY_NAME` 仍可作 legacy 名稱 fallback，但新設定不應再使用。
@@ -262,7 +266,7 @@ Codex 檢查是否已建立 thread，再用「驗證並綁定」納管。
 
 | 畫面標題 | 可以做什麼 | 何時生效 |
 | --- | --- | --- |
-| Agent 管理 | 新增 Agent，設定顯示名稱、Alias、adapter、Codex 建立模型、入口 Bot、Sender、啟用狀態及 bounded discussion 額度。入口 Bot 決定 mention／reply 路由，Sender 決定由哪個 Bot 帳號發出回覆；既有 Agent ID 為唯讀。 | 和 Discord Senders 一起按「驗證並儲存 Agent／Sender」；重新啟動 Bot 後生效。 |
+| Agent 管理 | 新增 Agent，設定顯示名稱、Alias、adapter、Codex 建立模型、入口 Bot、Sender、啟用狀態及 bounded discussion 額度。入口 Bot 決定 mention／reply 路由，Sender 決定由哪個 Bot 帳號發出回覆；既有 Agent ID 為唯讀。Codex Agent 可在同一區的「Codex 專案工作目錄」指定建立新 Thread 時使用的專案資料夾。 | 和 Discord Senders 一起按「驗證並儲存 Agent／Sender」；重新啟動 Bot 後生效。 |
 | Discord Senders | 新增 Discord 發言帳號，設定 Sender ID、標籤、Bot User ID、Token 與啟用狀態。Token 已設定且 Sender ID 未變時可留白保留。 | 和 Agents 一起按「驗證並儲存」；重新啟動 Bot 後生效。 |
 | Discord 授權使用者 | 新增／移除具本機名稱的使用者，並設定 DM 規則。名稱只作辨識，權限仍依 numeric User ID。 | 和授權頻道一起按「儲存使用者／頻道設定」；重新啟動 Bot 後生效。 |
 | Discord 授權頻道 | 新增／移除頻道、選擇允許使用者及是否需要 mention。新增頻道不會同時建立 Agent 或 AI 聊天窗。 | 和授權使用者一起按「儲存使用者／頻道設定」；重新啟動 Bot 後生效。 |

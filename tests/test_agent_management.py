@@ -10,7 +10,9 @@ from urllib import error, request
 from agent_bridge import admin_ui
 from agent_bridge.agent_management import (
     load_agent_management, merge_secret_placeholders, parse_agent_management,
+    resolve_codex_cwd,
     save_agent_management,
+    validate_agent_workdirs,
     validate_binding_associations,
     validate_removals,
 )
@@ -93,6 +95,23 @@ class AgentManagementTests(unittest.TestCase):
         self.assertTrue(redacted["senders"][0]["tokenConfigured"])
         self.assertNotIn("token", redacted["senders"][0])
         self.assertEqual(redacted["agents"][0]["model"], "gpt-test")
+        self.assertEqual(redacted["agents"][0]["cwd"], "")
+
+    def test_codex_workdir_resolves_relative_to_repo_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); project=root/"projects"/"alpha"; project.mkdir(parents=True)
+            raw=valid_raw(); raw["agents"][0]["cwd"]="projects/alpha"
+            value=parse_agent_management(raw)
+            self.assertEqual(resolve_codex_cwd(value.agents[0].cwd,root=root,fallback=root/"fallback"),project.resolve())
+            validate_agent_workdirs(value,root)
+
+            raw["agents"][0]["cwd"]="missing"
+            with self.assertRaisesRegex(ValueError,"不存在或不是資料夾"):
+                validate_agent_workdirs(parse_agent_management(raw),root)
+
+            raw=valid_raw(); raw["agents"][1]["cwd"]="projects/alpha"
+            with self.assertRaisesRegex(ValueError,"Antigravity 不使用"):
+                parse_agent_management(raw)
 
     def test_validation_rejects_duplicate_invalid_and_unknown_fields(self):
         cases=[]
@@ -246,6 +265,7 @@ class AgentManagementTests(unittest.TestCase):
             server=admin_ui.create_server(
                 config, root/"missing-bindings.json", {}, "", 0, 0,
                 codex_models=("gpt-test", "gpt-other"), default_codex_model="gpt-test",
+                default_codex_cwd=str(root),
             )
             thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
             base=f"http://127.0.0.1:{server.server_port}"
@@ -254,6 +274,7 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertNotIn("token",state["senders"][0])
                 self.assertEqual(state["codexModels"],["gpt-test","gpt-other"])
                 self.assertEqual(state["defaultCodexModel"],"gpt-test")
+                self.assertEqual(state["defaultCodexCwd"],str(root))
                 body=json.dumps(valid_raw()).encode()
                 bad=request.Request(base+"/api/save",data=body,method="POST",headers={"Content-Type":"application/json"})
                 with self.assertRaises(error.HTTPError) as caught: request.urlopen(bad)
@@ -271,6 +292,8 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertIn("Discord 授權使用者",admin_ui.HTML)
                 self.assertIn("Discord 授權頻道",admin_ui.HTML)
                 self.assertIn("建立模型",admin_ui.HTML)
+                self.assertIn("Codex 專案工作目錄",admin_ui.HTML)
+                self.assertIn('data-k="cwd"',admin_ui.HTML)
                 self.assertIn("目前不可用",admin_ui.HTML)
                 self.assertIn("由既有 Conversation／Project 決定",admin_ui.HTML)
                 self.assertIn("搬移全部 Agent",admin_ui.HTML)
@@ -283,6 +306,7 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertIn("detached Binding",admin_ui.HTML)
                 self.assertIn("#binding-management>section",admin_ui.HTML)
                 state["agents"][0]["displayName"]="Updated Agent"
+                state["agents"][0]["cwd"]=str(root)
                 state["senders"][0]["token"]=""
                 saved=request.Request(
                     base+"/api/save",data=json.dumps(state).encode(),method="POST",
@@ -291,6 +315,7 @@ class AgentManagementTests(unittest.TestCase):
                 self.assertEqual(json.loads(request.urlopen(saved).read()),{"saved":True})
                 updated=load_agent_management(config,{},"",0)
                 self.assertEqual(updated.agents[0].display_name,"Updated Agent")
+                self.assertEqual(updated.agents[0].cwd,str(root))
                 self.assertEqual(updated.senders[0].token,"private-test-placeholder")
                 self.assertNotIn("rebind",admin_ui.HTML.lower());self.assertNotIn("retire",admin_ui.HTML.lower())
             finally:
